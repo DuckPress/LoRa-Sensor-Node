@@ -1,0 +1,4 @@
+Lilygo/secrets.h
+Lilygo/secrets.txt
+**/build/
+*.bin
