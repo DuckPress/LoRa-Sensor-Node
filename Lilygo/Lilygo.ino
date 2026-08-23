@@ -558,8 +558,12 @@ void setup() {
       // just keeps the current settings — never flips them.
       bool otaRequested = false;
       {
-        char cfgQ[40];
-        snprintf(cfgQ, sizeof(cfgQ), "action=nodecfg&id=%u", (unsigned)NODE_ID);
+        // Report the running firmware version (fw=) so the cloud can confirm an
+        // OTA landed — the node→GAS nodecfg poll happens every WiFi wake and needs
+        // no gateway involvement, so version visibility doesn't depend on LoRa.
+        char cfgQ[64];
+        snprintf(cfgQ, sizeof(cfgQ), "action=nodecfg&id=%u&fw=%s",
+                 (unsigned)NODE_ID, FIRMWARE_VERSION);
         String cfgBody;
         if (gasFetch(cfgQ, cfgBody)) {
           bool sm = (cfgBody.indexOf("\"sm\":1") >= 0);
