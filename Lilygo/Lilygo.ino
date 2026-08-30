@@ -391,6 +391,28 @@ void setup() {
     }
   }
 
+  // ---- Clock-staleness guard (C2) ----
+  // The RTC runs at the right rate but can hold a wrong OFFSET if it hasn't been
+  // NTP-corrected in a long time (LoRa-only node, or a dead RTC backup cell). If
+  // the gap since the last successful NTP sync exceeds MAX_RTC_UNSYNCED_SEC,
+  // stop trusting the absolute time: flag rtc_valid=0 so the cloud uses the
+  // gateway's clock (gw_ts) instead of a drifted node_ts. The rate is fine, so
+  // (now - lastSync) is an honest elapsed time even when the offset is wrong.
+  if (data.rtcValid) {
+    Preferences clkPrefs;
+    clkPrefs.begin("clk", true);                 // read-only
+    uint32_t lastSync = clkPrefs.getUInt("lastsync", 0);
+    clkPrefs.end();
+    if (lastSync != 0 && data.epochSeconds > lastSync &&
+        (data.epochSeconds - lastSync) > MAX_RTC_UNSYNCED_SEC) {
+      Serial.printf("[RTC] Unsynced for ~%lu h (> %lu h) — flagging rtc_valid=0; "
+                    "cloud will use gw_ts\n",
+                    (unsigned long)((data.epochSeconds - lastSync) / 3600UL),
+                    (unsigned long)(MAX_RTC_UNSYNCED_SEC / 3600UL));
+      data.rtcValid = false;
+    }
+  }
+
   Serial.printf("[DATA] ts=%s  rtc=%s\n",
                 data.isoTimestamp, data.rtcValid ? "OK" : "EST");
   if (result.distanceOk) {
@@ -485,9 +507,14 @@ void setup() {
     Serial.println(F("[SafeMode] Skipping LoRa TX (radio off for recovery)"));
   } else if (!loraOk) {
     Serial.println(F("[LoRa] Skipping TX — init failed"));
-  } else if (!result.distanceOk) {
-    Serial.println(F("[LoRa] Skipping TX — no valid sensor data"));
   } else {
+    // Transmit EVERY wake, even when the distance read failed (dist=-1). A radar
+    // dropout must NOT silence the node — the payload still carries the rv/ev/bat
+    // flags and the -1 sentinel, so the cloud logs a distance-flagged reading
+    // ("node alive, sensor faulted") instead of going completely dark. This is
+    // the root-cause fix for the sheet stalling on an 8-minute -1 run. (C1)
+    if (!result.distanceOk)
+      Serial.println(F("[LoRa] Distance invalid — TX anyway as a flagged reading"));
     esp_task_wdt_reset();
     LoRaSendResult res = loraSend(data, s_lastWifiRssi);
     esp_task_wdt_reset();
@@ -547,7 +574,14 @@ void setup() {
         esp_task_wdt_reset();
       }
       if (nowUtc >= (time_t)NTP_MIN_VALID_EPOCH) {
-        rtcSyncIfDrifted((uint32_t)nowUtc + RTC_TZ_OFFSET_SEC, RTC_NTP_MAX_SKEW_SEC);
+        uint32_t localEpoch = (uint32_t)nowUtc + RTC_TZ_OFFSET_SEC;
+        rtcSyncIfDrifted(localEpoch, RTC_NTP_MAX_SKEW_SEC);
+        // Record the sync time (C2): lets the staleness guard above tell "clock
+        // verified recently" from "drifting for days" on later LoRa-only wakes.
+        Preferences clkPrefs;
+        clkPrefs.begin("clk", false);
+        clkPrefs.putUInt("lastsync", localEpoch);
+        clkPrefs.end();
       } else {
         Serial.println(F("[RTC] NTP not ready — RTC not resynced this wake"));
       }
@@ -622,7 +656,7 @@ void setup() {
         // Only upload the CURRENT reading directly if LoRa didn't already
         // confirm delivery — otherwise the gateway is already forwarding it
         // and a direct upload would just double-hit GAS.
-        if (loraStatus != 1 && result.distanceOk) {
+        if (loraStatus != 1) {   // (C1) back up even a distance-flagged reading
           if (backlogAtStart || s_backlogPending) {
             pendingAppend(data);
             s_backlogPending = true;
@@ -645,7 +679,7 @@ void setup() {
     } else {
       Serial.println(F("[WiFi] Could not connect"));
       // Back up the current reading only if LoRa delivery wasn't confirmed.
-      if (isWifiWake && loraStatus != 1 && result.distanceOk) {
+      if (isWifiWake && loraStatus != 1) {   // (C1) queue even a flagged reading
         wifiStatus = 0;
         pendingAppend(data);
         s_backlogPending = true;
@@ -657,7 +691,7 @@ void setup() {
     // confirm delivery. A LoRa-ACKed reading is already reaching the cloud
     // via the gateway, so buffering it would double-upload and needlessly
     // grow the queue. tidelog.csv on SD remains the complete record.
-    if (loraStatus != 1 && result.distanceOk) {
+    if (loraStatus != 1) {   // (C1) queue even a distance-flagged reading
       pendingAppend(data);
       s_backlogPending = true;
     }

@@ -4,7 +4,7 @@
 // ================================================================
 //  Firmware Version
 // ================================================================
-#define FIRMWARE_VERSION "1.2.4"
+#define FIRMWARE_VERSION "1.2.5"
 
 // ================================================================
 //  Node Identity
@@ -88,6 +88,14 @@ constexpr const char* NTP_SERVER2          = "time.google.com";
 constexpr uint32_t    NTP_SYNC_TIMEOUT_MS  = 5000;
 constexpr int32_t     RTC_NTP_MAX_SKEW_SEC = 2;            // resync if off by > this
 constexpr uint32_t    NTP_MIN_VALID_EPOCH  = 1700000000UL; // ~2023-11; "set" beyond this
+// Clock-staleness guard (C2): the DS3231 runs at the right RATE but can sit at a
+// wrong OFFSET if it hasn't been NTP-corrected in a long time (e.g. a LoRa-only
+// node that never gets WiFi, or a dead RTC backup cell). Once the time since the
+// last successful NTP sync exceeds this, the node stops trusting its own
+// timestamp — it flags rtc_valid=0 so the cloud falls back to the gateway's
+// clock (gw_ts) instead of a drifted node_ts. Set generously so a normal WiFi
+// cadence never trips it.
+constexpr uint32_t    MAX_RTC_UNSYNCED_SEC = 48UL * 3600UL; // 48 h
 
 // Malaysia = UTC+8. NTP is fetched as plain UTC (configTime(0,0,…) in
 // Lilygo.ino, so time(nullptr) is unambiguously a true Unix epoch) and this
@@ -265,7 +273,13 @@ constexpr int8_t   PIN_LD2413_PWR = -1;
 
 constexpr uint32_t LD2413_BAUD             = 115200;
 constexpr float    LD2413_MIN_CM           =   15.0f;  // module floor 0.15 m
-constexpr float    LD2413_MAX_CM           = 1000.0f;  // module ceiling 10 m
+// Clamp the ACCEPTED range to the mount geometry, not the module's 10 m ceiling.
+// Water can never sit farther than the sensor's own height above the datum
+// (SENSOR_HEIGHT_CM, ~450), so anything beyond that + a little noise margin is
+// physically impossible — a "no-target" ceiling artifact (e.g. the 590 cm the
+// radar reports when it loses lock). Rejecting it (-> -1) beats logging a bogus
+// water_level=0. Raise this if you mount the sensor higher than ~455 cm. (H1)
+constexpr float    LD2413_MAX_CM           =  460.0f;  // ~= SENSOR_HEIGHT_CM + margin
 constexpr uint8_t  LD2413_SAMPLE_N         =   20;     // frames collected per read
 constexpr uint8_t  LD2413_TRIM_N           =    5;     // drop 5 low + 5 high
 constexpr uint32_t LD2413_FRAME_TIMEOUT_MS =  300;     // per-frame read timeout
@@ -279,7 +293,7 @@ constexpr uint32_t LD2413_BOOT_MS          =  700;     // power-up → first dat
 // then set back to 0 and re-flash.
 #define LD2413_CONFIGURE_ON_BOOT 0
 constexpr uint16_t LD2413_CFG_MIN_MM    =  150;   // reporting floor (mm)
-constexpr uint16_t LD2413_CFG_MAX_MM    = 6000;   // reporting ceiling (mm) — SENSOR_HEIGHT + margin
+constexpr uint16_t LD2413_CFG_MAX_MM    = 4600;   // reporting ceiling (mm) ~= LD2413_MAX_CM (only applied when LD2413_CONFIGURE_ON_BOOT=1)
 constexpr uint16_t LD2413_CFG_REPORT_MS =  160;   // stream cycle (ms) — 50..1000
 
 // SHT3x I2C address
