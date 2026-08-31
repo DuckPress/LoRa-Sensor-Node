@@ -25,3 +25,6 @@ void           loraShutdown();
 bool           loraReady();        // true once loraInit() has succeeded this wake
 int16_t        loraLastAckRSSI();  // RSSI (dBm) of the most recently received ACK
 float          loraLastAckSNR();   // SNR  (dB)  of the most recently received ACK
+// Gateway's UTC+8 epoch parsed from the last ACK ("ACK:<seq>:<epoch>"), or 0 if
+// the ACK carried no time. Lets the node correct its RTC over LoRa (no WiFi).
+uint32_t       loraLastGatewayEpoch();

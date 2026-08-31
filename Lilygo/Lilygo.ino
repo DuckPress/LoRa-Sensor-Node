@@ -534,6 +534,22 @@ void setup() {
     // stalled gateway heartbeat via the Sheets health-watch.
     if (loraStatus == 1) {
       s_consecutiveNoAck = 0;
+
+      // Gateway -> node clock sync over LoRa: the ACK can carry the gateway's
+      // current UTC+8 epoch. When it does, correct the RTC from it so the node
+      // (and its SD log) keeps REAL time with NO WiFi/NTP of its own. It applies
+      // from the next wake (this wake's SD row is already written) and refreshes
+      // the last-sync record the C2 staleness guard checks.
+      uint32_t gwEpoch = loraLastGatewayEpoch();
+      if (gwEpoch > NTP_MIN_VALID_EPOCH) {
+        rtcSyncIfDrifted(gwEpoch, RTC_NTP_MAX_SKEW_SEC);
+        Preferences clkPrefs;
+        clkPrefs.begin("clk", false);
+        clkPrefs.putUInt("lastsync", gwEpoch);
+        clkPrefs.end();
+        Serial.printf("[RTC] Synced from gateway ACK (epoch %lu)\n",
+                      (unsigned long)gwEpoch);
+      }
     } else {
       s_consecutiveNoAck++;
       Serial.printf("[LoRa] Gateway unacknowledged for %lu consecutive wake(s)\n",

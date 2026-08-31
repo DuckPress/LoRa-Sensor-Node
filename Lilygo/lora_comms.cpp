@@ -17,9 +17,13 @@ static SX1262 radio = new Module(
   loraSPI
 );
 
-static bool    s_loraReady   = false;
-static int16_t s_lastAckRSSI = 0;
-static float   s_lastAckSNR  = 0.0f;
+static bool     s_loraReady   = false;
+static int16_t  s_lastAckRSSI = 0;
+static float    s_lastAckSNR  = 0.0f;
+// Gateway's UTC+8 epoch parsed from the last ACK ("ACK:<seq>:<epoch>"), or 0 if
+// the ACK carried no time (older gateway, or its clock not yet NTP-valid). Lets
+// the node correct its RTC over LoRa without any WiFi/NTP of its own.
+static uint32_t s_ackGwEpoch  = 0;
 
 // Sequence number persists across deep sleep so the gateway can detect
 // missed packets even when the node wakes and re-initialises each cycle.
@@ -243,6 +247,8 @@ LoRaSendResult loraSend(const SensorData& data, int32_t wifiRssi) {
     // from a previous (already-abandoned) transmission.
     char expectedAck[16];
     snprintf(expectedAck, sizeof(expectedAck), "ACK:%u", (unsigned)s_seqNum);
+    const size_t expLen = strlen(expectedAck);
+    s_ackGwEpoch = 0;   // reset — populated below only if this ACK carries a time
 
     bool gotAck = false;
 
@@ -257,7 +263,17 @@ LoRaSendResult loraSend(const SensorData& data, int32_t wifiRssi) {
         int rxState = radio.readData(ackStr);
         if (rxState == RADIOLIB_ERR_NONE) {
           ackStr.trim();
-          if (ackStr == expectedAck) { gotAck = true; break; }
+          // Accept "ACK:<seq>" (older gateway) OR "ACK:<seq>:<epoch>" (newer:
+          // the gateway appends its UTC+8 epoch so we can correct the RTC over
+          // LoRa). Require the char right after our seq to be ':' so a short
+          // "ACK:12" can't prefix-match a stale "ACK:123".
+          bool match = (ackStr == expectedAck);
+          if (!match && ackStr.length() > expLen &&
+              ackStr.startsWith(expectedAck) && ackStr.charAt(expLen) == ':') {
+            match = true;
+            s_ackGwEpoch = (uint32_t)strtoul(ackStr.c_str() + expLen + 1, nullptr, 10);
+          }
+          if (match) { gotAck = true; break; }
           Serial.printf("[LoRa] Unexpected/stale response: \"%s\" (wanted \"%s\")\n",
                         ackStr.c_str(), expectedAck);
         } else {
@@ -312,5 +328,6 @@ void loraShutdown() {
 // Small accessors for state cached during the last send (used by logging / the
 // gateway has its own copies for the heartbeat).
 bool    loraReady()       { return s_loraReady; }   // radio initialised this wake?
-int16_t loraLastAckRSSI() { return s_lastAckRSSI; } // RSSI of last ACK (dBm)
-float   loraLastAckSNR()  { return s_lastAckSNR; }  // SNR  of last ACK (dB)
+int16_t  loraLastAckRSSI()     { return s_lastAckRSSI; } // RSSI of last ACK (dBm)
+float    loraLastAckSNR()      { return s_lastAckSNR; }  // SNR  of last ACK (dB)
+uint32_t loraLastGatewayEpoch(){ return s_ackGwEpoch; }  // UTC+8 epoch from last ACK, 0 if none
