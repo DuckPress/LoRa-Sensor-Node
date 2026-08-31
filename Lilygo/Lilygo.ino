@@ -561,6 +561,9 @@ void setup() {
   //  WiFi / OTA / pending flush (secondary path — conditional)
   // ================================================================
   int8_t wifiStatus = -1;  // -1=not an upload wake / no data, 0=fail, 1=uploaded
+  // True once a WiFi wake has (connected and) run the WiFi backlog flush this
+  // wake — so the LoRa backlog flush below doesn't also drain the same queue.
+  bool   wifiFlushed = false;
 
   if (s_safeMode) {
     Serial.println(F("[SafeMode] Skipping WiFi/OTA/flush (radio off for recovery)"));
@@ -664,6 +667,7 @@ void setup() {
           flushed = pendingFlush(earlyBatV, s_flushCap);
         }
         esp_task_wdt_reset();
+        wifiFlushed = true;   // WiFi wake handled the backlog — don't LoRa-flush too
         s_backlogPending = (pendingCount() > 0);
         if (flushed > 0) {
           Serial.printf("[Pending] Recovered %lu queued readings\n",
@@ -711,6 +715,28 @@ void setup() {
       pendingAppend(data);
       s_backlogPending = true;
     }
+  }
+
+  // ================================================================
+  //  LoRa backlog flush (backlog-LoRa)
+  //
+  //  On wakes the WiFi flush did NOT handle — every non-WiFi wake, and a WiFi
+  //  wake that couldn't connect — drain the pending queue over LoRa through the
+  //  gateway, so a node with no WiFi still recovers its backlog. Runs only after
+  //  the real-time reading was ACKed (loraStatus==1 => the link is proven up),
+  //  respects the remote pause_flush knob, and is bounded/battery-gated inside
+  //  loraFlushPending(). earlyBatV is the pre-radio resting voltage.
+  // ================================================================
+  if (!s_safeMode && loraStatus == 1 && !wifiFlushed && !s_pauseFlush &&
+      s_backlogPending) {
+    esp_task_wdt_reset();
+    uint32_t loraFlushed = loraFlushPending(earlyBatV);
+    esp_task_wdt_reset();
+    if (loraFlushed > 0) {
+      Serial.printf("[LoRaFlush] Recovered %lu queued readings over LoRa\n",
+                    (unsigned long)loraFlushed);
+    }
+    s_backlogPending = (pendingCount() > 0);
   }
 
   // ================================================================

@@ -25,3 +25,12 @@ uint32_t flushBudgetForVoltage(float batteryV);
 
 // Return the number of entries currently in the queue (0 if file absent).
 uint32_t pendingCount();
+
+// Drain the pending queue over LoRa (oldest-first) through the gateway, instead
+// of WiFi — so a node with no WiFi can still recover its backlog. Each entry is
+// sent as an ordinary LoRa packet (loraSend); a delivered entry is dropped, a
+// NO_ACK stops the flush (link down) and keeps the rest. Drains as many as it
+// can within LORA_FLUSH_BUDGET_MS. batteryV is the pre-radio resting voltage
+// (skipped below BAT_FLUSH_LOW_V). Call only after the real-time reading was
+// ACKed. Returns the number sent over LoRa this wake.
+uint32_t loraFlushPending(float batteryV);

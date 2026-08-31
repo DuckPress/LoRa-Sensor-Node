@@ -1,6 +1,7 @@
 #include "pending.h"
 #include "config.h"
 #include "gas_upload.h"
+#include "lora_comms.h"   // loraSend() — LoRa backlog flush path (loraFlushPending)
 #include <SD.h>
 #include <WiFi.h>
 #include <esp_task_wdt.h>
@@ -386,4 +387,159 @@ uint32_t pendingCount() {
   }
   f.close();
   return count;
+}
+
+// ================================================================
+//  pendingLineToSensorData — reconstruct a SensorData from one queue line (the
+//  "data" part, after the retry prefix) so it can be re-sent over LoRa. Mirrors
+//  pendingLineToQuery's parse. Validity flags are inferred from the stored
+//  sentinels (-1 / -999) the same way the live reading set them. Returns false
+//  for a corrupt/unparseable line.
+// ================================================================
+static bool pendingLineToSensorData(const String& line, SensorData& d) {
+  if (line.length() < 5) return false;
+
+  char  ts[24] = { 0 };
+  float dist   = -1.0f, distRaw = -1.0f, wl  = -1.0f;
+  float temp   = -999.0f, hum   = -1.0f, bat = -1.0f;
+  float sd     = -1.0f;
+  int   bn     = 0, sm = 0, mv = 0;
+
+  int parsed = sscanf(line.c_str(), "%23[^,],%f,%f,%f,%f,%f,%f,%f,%d,%d,%d",
+                      ts, &dist, &distRaw, &wl, &temp, &hum, &bat,
+                      &sd, &bn, &sm, &mv);
+  if (parsed < 7 || ts[0] == '\0') return false;
+
+  d = SensorData();   // start from defaults
+  strncpy(d.isoTimestamp, ts, sizeof(d.isoTimestamp) - 1);
+  d.distanceRaw   = distRaw;
+  d.distanceCm    = dist;
+  d.waterLevelCm  = wl;
+  d.distanceValid = (dist >= 0.0f);       // -1 sentinel => flagged (C1) reading
+  d.tempC         = temp;
+  d.humidity      = hum;
+  d.envValid      = (temp > -100.0f);     // -999 sentinel => env invalid
+  d.batV          = bat;
+  d.batValid      = (bat > 0.0f);
+  d.burstSd       = sd;
+  d.burstN        = (uint8_t)bn;
+  d.surveyMode    = (sm != 0);
+  d.moved         = (mv != 0);
+  d.rtcValid      = true;                 // the queued ts is a real logged time
+  return true;
+}
+
+// ================================================================
+//  loraFlushPending — drain the pending queue over LoRa (oldest-first) through
+//  the gateway, for wakes the WiFi flush didn't handle. Crash-safe via the same
+//  temp-file rename pattern as pendingFlush(): a delivered entry is dropped, a
+//  NO_ACK stops the flush and the remainder is preserved for the next wake.
+// ================================================================
+uint32_t loraFlushPending(float batteryV) {
+  static const char* LORA_TMP = "/pending.ltmp";
+
+  // Recover an interrupted flush (queue removed, temp holds the kept remainder).
+  if (!SD.exists(PENDING_FILENAME) && SD.exists(LORA_TMP)) {
+    SD.rename(LORA_TMP, PENDING_FILENAME);
+    Serial.println(F("[LoRaFlush] Recovered queue from interrupted flush"));
+  }
+  if (!SD.exists(PENDING_FILENAME)) return 0;
+
+  // Same battery gate as the WiFi flush: defer entirely near cutoff so the LoRa
+  // TX burst can't brown out a depleted cell (an implausible USB-only reading is
+  // not a real cell, so it's never gated).
+  if (batteryV > BAT_PLAUSIBLE_MIN_V && batteryV < BAT_FLUSH_LOW_V) {
+    Serial.printf("[LoRaFlush] Battery %.2fV low — flush deferred\n", batteryV);
+    return 0;
+  }
+
+  File in = SD.open(PENDING_FILENAME, FILE_READ);
+  if (!in) return 0;
+  SD.remove(LORA_TMP);
+  File out = SD.open(LORA_TMP, FILE_WRITE);
+  if (!out) { in.close(); return 0; }
+
+  uint32_t sent = 0, kept = 0, dropped = 0;
+  bool           stop    = false;          // link down / budget hit => keep the rest
+  const uint32_t startMs = millis();
+
+  while (in.available()) {
+    esp_task_wdt_reset();
+    String line = in.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+
+    // Corruption guard (same as pendingFlush): an oversized "line" is a torn
+    // write — quarantine the whole queue rather than trust the rest.
+    if (line.length() >= PENDING_MAX_LINE_LEN) {
+      Serial.printf("[LoRaFlush] Oversized line (%u B) — queue corrupt\n",
+                    (unsigned)line.length());
+      in.close(); out.close(); SD.remove(LORA_TMP);
+      quarantinePendingFile();
+      return sent;
+    }
+
+    // Parse the "N|data" retry-count prefix (tolerate pre-counter lines as 0).
+    uint8_t retries = 0;
+    String  data    = line;
+    int     bar     = line.indexOf('|');
+    if (bar > 0 && bar <= 3) {
+      String prefix = line.substring(0, bar);
+      bool   numeric = true;
+      for (unsigned int k = 0; k < prefix.length(); k++) {
+        if (!isDigit(prefix[k])) { numeric = false; break; }
+      }
+      if (numeric) { retries = (uint8_t)prefix.toInt(); data = line.substring(bar + 1); }
+    }
+
+    // Stopped (a NO_ACK earlier), or out of this wake's time budget: defer the
+    // rest of the queue unchanged to the next wake.
+    if (stop || (millis() - startMs) > LORA_FLUSH_BUDGET_MS) {
+      out.print(retries); out.print('|'); out.print(data); out.print('\n'); kept++;
+      continue;
+    }
+
+    SensorData d;
+    if (!pendingLineToSensorData(data, d)) {
+      // Corrupt line — dropping it is the only way past it (tidelog.csv keeps
+      // the full record). No TX happened, so it doesn't burn the budget.
+      Serial.printf("[LoRaFlush] Dropping corrupt entry: %s\n", data.c_str());
+      dropped++;
+      continue;
+    }
+
+    esp_task_wdt_reset();
+    LoRaSendResult r = loraSend(d, 0);
+    esp_task_wdt_reset();
+    if (r == LoRaSendResult::OK) {
+      sent++;                                // delivered + ACKed => drop from queue
+    } else {
+      // NO_ACK / TX error => gateway or link is down. Keep this entry (until it
+      // has failed too many times) and stop sending; copy it + the tail to temp.
+      if (retries + 1 >= PENDING_MAX_RETRIES) {
+        Serial.printf("[LoRaFlush] Dropping entry after %u failed attempts: %s\n",
+                      retries + 1, data.c_str());
+        dropped++;
+      } else {
+        out.print(retries + 1); out.print('|'); out.print(data); out.print('\n'); kept++;
+      }
+      stop = true;
+    }
+  }
+  in.close();
+  out.close();
+
+  // Replace the queue with the kept remainder, or clear it. A crash between the
+  // remove and the rename is healed by the recovery check at the top next wake.
+  SD.remove(PENDING_FILENAME);
+  if (kept > 0 && SD.exists(LORA_TMP)) {
+    SD.rename(LORA_TMP, PENDING_FILENAME);
+  } else {
+    SD.remove(LORA_TMP);
+  }
+  if (sent > 0 || kept > 0 || dropped > 0) {
+    Serial.printf("[LoRaFlush] Sent %lu over LoRa; %lu still queued, %lu dropped\n",
+                  (unsigned long)sent, (unsigned long)kept, (unsigned long)dropped);
+  }
+  return sent;
 }

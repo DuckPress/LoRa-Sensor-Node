@@ -4,7 +4,7 @@
 // ================================================================
 //  Firmware Version
 // ================================================================
-#define FIRMWARE_VERSION "1.2.6"
+#define FIRMWARE_VERSION "1.2.7"
 
 // ================================================================
 //  Node Identity
@@ -134,11 +134,11 @@ constexpr uint32_t OTA_HTTP_TIMEOUT_MS = 15000;
 //  OTA_CHECK_EVERY_N  — check GitHub for firmware updates every N wakes.
 //                         2880 wakes × 30 s = ~24 h.
 // ================================================================
-constexpr uint64_t SLEEP_DURATION_US   = 10ULL * 1000000ULL;  // 10 s — bench-test cadence
-constexpr uint32_t WIFI_UPLOAD_EVERY_N = 30;        // approximately every five minutes at a 10 s cadence
+constexpr uint64_t SLEEP_DURATION_US   = 60ULL * 1000000ULL;  // 60 s — one reading per minute
+constexpr uint32_t WIFI_UPLOAD_EVERY_N = 5;         // every ~5 minutes at the 60 s cadence
 // Automatic OTA checks remain infrequent. A remote request in the Config tab
 // causes a check on the next WiFi wake instead.
-constexpr uint32_t OTA_CHECK_EVERY_N   = 25920;     // approximately every three days at a 10 s cadence
+constexpr uint32_t OTA_CHECK_EVERY_N   = 4320;      // every ~3 days at the 60 s cadence
 
 // ----------------------------------------------------------------
 //  Survey mode — bathymetric-reference operation
@@ -441,8 +441,8 @@ constexpr const char* LOG_HEADER   =
 //  chosen so RTC fallback timestamps remain accurate even when the
 //  device slows down during a calm period.
 // ================================================================
-constexpr uint64_t SLEEP_MIN_US           = 10ULL  * 1000000ULL;  // 10 s  — fast
-constexpr uint64_t SLEEP_MAX_US           = 10ULL * 1000000ULL;  // 10 s — pinned to the fixed cadence (adaptive off)
+constexpr uint64_t SLEEP_MIN_US           = 60ULL * 1000000ULL;  // 60 s — pinned to the fixed cadence (adaptive off)
+constexpr uint64_t SLEEP_MAX_US           = 60ULL * 1000000ULL;  // 60 s — pinned to the fixed cadence (adaptive off)
 constexpr float    ADAPTIVE_DELTA_FAST_CM =  5.0f;  // cm — shorten sleep above this
 constexpr float    ADAPTIVE_DELTA_SLOW_CM =  1.0f;  // cm — lengthen sleep below this
 
@@ -524,6 +524,24 @@ constexpr uint16_t PENDING_FLUSH_SMALL  =  5;
 //  and defers the rest so the node doesn't chase itself into a brownout that
 //  the resting reading couldn't see.
 constexpr float    BAT_FLUSH_SAG_FLOOR_V = 3.45f;
+
+// ----------------------------------------------------------------
+//  LoRa backlog flush
+//
+//  On wakes the WiFi flush didn't handle (non-WiFi wakes, or a WiFi wake that
+//  couldn't connect), the node drains its pending queue over LoRa too — so a
+//  node with NO WiFi can still recover its backlog through the gateway. It runs
+//  ONLY after the real-time reading was ACKed (link proven up), sends queued
+//  readings oldest-first as ordinary LoRa packets (the gateway uploads them like
+//  any reading — no gateway change), and stops on the first NO_ACK (link down).
+//  It drains as many as it can within LORA_FLUSH_BUDGET_MS, bounded so the flush
+//  can't overrun the watchdog window or keep the node awake indefinitely. Same
+//  battery gate as the WiFi flush (skipped below BAT_FLUSH_LOW_V).
+//    Trade-off: LoRa is slower/costlier per reading than WiFi (a packet + ACK
+//    each), so a big backlog drains over minutes of airtime — set the budget to
+//    balance recovery speed against airtime/power.
+// ----------------------------------------------------------------
+constexpr uint32_t LORA_FLUSH_BUDGET_MS = 25000;   // <= WDT window (60 s) with margin
 
 // ================================================================
 //  OLED display hold time before sleep
