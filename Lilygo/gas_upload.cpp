@@ -28,8 +28,16 @@ bool gasFetch(const char* query, String& bodyOut) {
     Serial.println(F("[Upload] GAS endpoint not provisioned (see /secrets.txt)"));
     return false;
   }
+  // Cloud write token (SD /secrets.txt gas_token=). Appended to EVERY request
+  // here — live upload, pending flush, batch and the nodecfg poll all share
+  // this one builder — so the Apps Script can gate its writes on it. The
+  // cloud accepts one outer token for a whole base64 batch. Empty = omitted,
+  // which keeps an un-provisioned node working while cloud auth is off.
+  const char* gasTok = secretGasToken();
   char url[2304];
-  int n = snprintf(url, sizeof(url), "https://%s%s?%s", gasHost, gasPath, query);
+  int n = (gasTok[0] != '\0')
+    ? snprintf(url, sizeof(url), "https://%s%s?%s&token=%s", gasHost, gasPath, query, gasTok)
+    : snprintf(url, sizeof(url), "https://%s%s?%s", gasHost, gasPath, query);
   if (n <= 0 || (size_t)n >= sizeof(url)) {
     Serial.println(F("[Upload] URL too long — dropping"));
     return false;

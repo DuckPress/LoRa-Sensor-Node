@@ -14,6 +14,7 @@ static struct {
   char    gasHost[64];
   char    gasPath[200];
   char    loraToken[33];
+  char    gasToken[65];                // GAS write token (must match AUTH_TOKEN in the cloud)
   bool    valid;
 } s_sec;
 
@@ -71,6 +72,8 @@ static bool parseSecrets(const String& text) {
       copyField(s_sec.gasPath, sizeof(s_sec.gasPath), val);
     } else if (key == "lora_token") {
       copyField(s_sec.loraToken, sizeof(s_sec.loraToken), val);
+    } else if (key == "gas_token") {
+      copyField(s_sec.gasToken, sizeof(s_sec.gasToken), val);
     }
   }
 
@@ -134,3 +137,4 @@ const char* secretWifiPass(uint8_t i)     { return (i < s_sec.wifiCount) ? s_sec
 const char* secretGasHost()               { return s_sec.gasHost; }
 const char* secretGasPath()               { return s_sec.gasPath; }
 const char* secretLoraToken()             { return s_sec.loraToken; }
+const char* secretGasToken()              { return s_sec.gasToken; }

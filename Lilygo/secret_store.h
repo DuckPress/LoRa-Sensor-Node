@@ -19,6 +19,8 @@
 //      gas_host=script.google.com
 //      gas_path=/macros/s/AKfy.../exec
 //      lora_token=            # blank = LoRa auth disabled (must match gateway)
+//      gas_token=             # blank = cloud write auth disabled (must match
+//                             #   the Apps Script AUTH_TOKEN Script Property)
 //
 //  The gateway (Xiao) is USB-flashed only — its binary is never published — so
 //  it keeps its compile-time secrets.h unchanged.
@@ -43,3 +45,4 @@ const char* secretWifiPass(uint8_t i);   // "" if i out of range
 const char* secretGasHost();             // "" if unset
 const char* secretGasPath();             // "" if unset
 const char* secretLoraToken();           // "" = LoRa auth disabled
+const char* secretGasToken();            // "" = cloud write auth disabled
