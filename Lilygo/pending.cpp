@@ -27,12 +27,12 @@ static bool pendingLineToQuery(const String& line, String& queryOut) {
   char  ts[24] = { 0 };
   float dist   = -1.0f, distRaw = -1.0f, wl  = -1.0f;
   float temp   = -999.0f, hum   = -1.0f, bat = -1.0f;
-  float sd     = -1.0f;
+  float sd     = -1.0f, tl = -1.0f, pr = -1.0f;   // tl/pr absent on pre-1.2.9 lines
   int   bn     = 0, sm = 0, mv = 0;
 
-  int parsed = sscanf(line.c_str(), "%23[^,],%f,%f,%f,%f,%f,%f,%f,%d,%d,%d",
+  int parsed = sscanf(line.c_str(), "%23[^,],%f,%f,%f,%f,%f,%f,%f,%d,%d,%d,%f,%f",
                       ts, &dist, &distRaw, &wl, &temp, &hum, &bat,
-                      &sd, &bn, &sm, &mv);
+                      &sd, &bn, &sm, &mv, &tl, &pr);
   if (parsed < 7 || ts[0] == '\0') return false;
 
   char q[512];
@@ -49,9 +49,11 @@ static bool pendingLineToQuery(const String& line, String& queryOut) {
     "&sd=%.2f"
     "&n=%d"
     "&sm=%d"
-    "&mv=%d",
+    "&mv=%d"
+    "&tl=%.1f"
+    "&pr=%.1f",
     ts, dist, distRaw, wl, temp, hum, bat,
-    (unsigned)NODE_ID, sd, bn, sm, mv);
+    (unsigned)NODE_ID, sd, bn, sm, mv, tl, pr);
   if (n <= 0 || (size_t)n >= sizeof(q)) return false;
 
   queryOut = q;
@@ -99,7 +101,7 @@ void pendingAppend(const SensorData& data) {
   // PENDING_MAX_RETRIES) — dropped entries are counted this way instead of
   // being kept forever.
   f.print("0|");
-  f.printf("%s,%.2f,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f,%u,%d,%d\n",
+  f.printf("%s,%.2f,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f,%u,%d,%d,%.1f,%.1f\n",
     data.isoTimestamp,
     data.distanceValid ? data.distanceCm   : -1.0f,
     data.distanceValid ? data.distanceRaw  : -1.0f,
@@ -111,7 +113,9 @@ void pendingAppend(const SensorData& data) {
     data.burstSd,
     (unsigned)data.burstN,
     data.surveyMode    ? 1 : 0,
-    data.moved         ? 1 : 0);
+    data.moved         ? 1 : 0,
+    data.tiltDeg,
+    data.pressureHpa);
   f.close();
 }
 
@@ -402,12 +406,12 @@ static bool pendingLineToSensorData(const String& line, SensorData& d) {
   char  ts[24] = { 0 };
   float dist   = -1.0f, distRaw = -1.0f, wl  = -1.0f;
   float temp   = -999.0f, hum   = -1.0f, bat = -1.0f;
-  float sd     = -1.0f;
+  float sd     = -1.0f, tl = -1.0f, pr = -1.0f;   // tl/pr absent on pre-1.2.9 lines
   int   bn     = 0, sm = 0, mv = 0;
 
-  int parsed = sscanf(line.c_str(), "%23[^,],%f,%f,%f,%f,%f,%f,%f,%d,%d,%d",
+  int parsed = sscanf(line.c_str(), "%23[^,],%f,%f,%f,%f,%f,%f,%f,%d,%d,%d,%f,%f",
                       ts, &dist, &distRaw, &wl, &temp, &hum, &bat,
-                      &sd, &bn, &sm, &mv);
+                      &sd, &bn, &sm, &mv, &tl, &pr);
   if (parsed < 7 || ts[0] == '\0') return false;
 
   d = SensorData();   // start from defaults
@@ -425,6 +429,8 @@ static bool pendingLineToSensorData(const String& line, SensorData& d) {
   d.burstN        = (uint8_t)bn;
   d.surveyMode    = (sm != 0);
   d.moved         = (mv != 0);
+  d.tiltDeg       = tl;
+  d.pressureHpa   = pr;
   d.rtcValid      = true;                 // the queued ts is a real logged time
   return true;
 }

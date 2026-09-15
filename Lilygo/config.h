@@ -4,7 +4,7 @@
 // ================================================================
 //  Firmware Version
 // ================================================================
-#define FIRMWARE_VERSION "1.2.8"
+#define FIRMWARE_VERSION "1.2.9"
 
 // ================================================================
 //  Node Identity
@@ -309,14 +309,42 @@ constexpr uint8_t DS3231_ADDR = 0x68;   // RTC — used by the I2C bus health-ch
 //  measures the gauge's tilt; a change from the installed baseline beyond
 //  TILT_MOVED_DEG raises the "moved" flag (mv=1), carried to the sheet/
 //  dashboard and flagged by the tide-reduction QA. The baseline is captured on
-//  the first read after a cold boot and held in RTC RAM.
+//  the first read and persisted in NVS (survives resets); clear it remotely
+//  with the Config-sheet key reset_tilt_baseline=1 after re-levelling.
 //
-//  OFF by default — enable only when a LIS2DW12 is fitted. NOTE: this driver
-//  is UNVERIFIED on real hardware; bench-test before relying on it for QA.
+//  RUNTIME-DETECTED: the driver always compiles in and probes 0x19 then 0x18
+//  at boot, so one OTA binary works with or without the sensor fitted. The
+//  tilt angle itself (deg from vertical) is also transmitted (tl=) so the
+//  cloud can cosine-correct the radar range (Config: tilt_correct=1).
+//
+//  Motion wake: wire the LIS2DW12 INT1 pin to a free RTC-capable GPIO and set
+//  PIN_TILT_INT (T3-S3 candidates: 12, 21, 9, 10). The sensor then stays in its
+//  1.6 Hz low-power mode (~1 µA) through deep sleep and a knock/tilt event
+//  wakes the node, which logs that wake as moved=1. -1 = disabled.
 // ----------------------------------------------------------------
-//#define ENABLE_TILT_LIS2DW12
-constexpr uint8_t LIS2DW12_ADDR  = 0x19;   // SA0/SDO high; use 0x18 if tied low
-constexpr float   TILT_MOVED_DEG = 1.0f;   // tilt change (deg) that flags "moved"
+constexpr uint8_t LIS2DW12_ADDR     = 0x19;   // SA0/SDO high (probed first)
+constexpr uint8_t LIS2DW12_ADDR_ALT = 0x18;   // SA0/SDO low
+constexpr float   TILT_MOVED_DEG    = 1.0f;   // tilt change (deg) that flags "moved"
+constexpr int8_t  PIN_TILT_INT      = -1;     // LIS2DW12 INT1 -> ESP32 RTC GPIO; -1 = no motion wake
+constexpr uint8_t TILT_WAKE_THS_LSB = 8;      // wake-up threshold, 1 LSB = 31.25 mg (8 ≈ 250 mg)
+
+// ----------------------------------------------------------------
+//  Optional barometer (BMP280 / BME280 on Wire1, runtime-detected)
+//
+//  Atmospheric pressure is a genuine tide input (inverse-barometer effect,
+//  ~1 cm of sea level per hPa) — it lets the residual/surge on the dashboard
+//  be attributed. Probed at 0x76 then 0x77 by chip ID (0x58 BMP280, 0x60
+//  BME280); absent = silently skipped. Read in forced mode once per wake
+//  (~10 ms, µA when idle) and transmitted as pr= (hPa, station pressure).
+//  Humidity from a BME280 is NOT used — the SHT3x is the RH reference.
+// ----------------------------------------------------------------
+constexpr uint8_t BARO_ADDR     = 0x76;
+constexpr uint8_t BARO_ADDR_ALT = 0x77;
+
+// ----------------------------------------------------------------
+//  Crash capture (see crashlog.h): core-dump summaries are appended here.
+// ----------------------------------------------------------------
+constexpr const char* CRASHLOG_FILENAME = "/crashlog.csv";
 
 // ================================================================
 //  Kalman Filter — 1-D constant-position model
@@ -425,7 +453,7 @@ constexpr const char* BOOTLOG_FILENAME = "/bootlog.csv";
 constexpr const char* LOG_HEADER   =
     "timestamp,rtc_valid,dist_raw_cm,dist_kalman_cm,water_level_cm,"
     "temp_c,humidity_pct,bat_v,wifi_rssi,wake_count,"
-    "burst_sd_cm,burst_n,survey_mode,mount_moved\n";
+    "burst_sd_cm,burst_n,survey_mode,mount_moved,tilt_deg,pressure_hpa\n";
 
 // ================================================================
 //  Adaptive Deep Sleep

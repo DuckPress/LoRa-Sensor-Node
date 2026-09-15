@@ -17,3 +17,7 @@ bool sdReady();
 // Append one line to /bootlog.csv recording a reset reason (called only for
 // real reboots, not deep-sleep wakes), so brownouts/panics are visible later.
 bool sdLogBootEvent(const char* reason, uint32_t wakeCount, const char* isoTs);
+
+// Append one core-dump summary line to /crashlog.csv (see crashlog.h).
+// summaryCsv = "reason,stage,exc,excname,task,btstatus,pc,backtrace,elfsha".
+bool sdLogCrashEvent(const char* isoTs, uint32_t wakeCount, const char* summaryCsv);

@@ -31,7 +31,9 @@ bool uploadData(const SensorData& data, int32_t wifiRssi) {
     "&sd=%.2f"
     "&n=%u"
     "&sm=%d"
-    "&mv=%d",
+    "&mv=%d"
+    "&tl=%.1f"
+    "&pr=%.1f",
     data.isoTimestamp,
     data.distanceValid ? data.distanceCm   : -1.0f,
     data.distanceValid ? data.distanceRaw  : -1.0f,
@@ -48,7 +50,9 @@ bool uploadData(const SensorData& data, int32_t wifiRssi) {
     data.burstSd,
     (unsigned)data.burstN,
     data.surveyMode    ? 1 : 0,
-    data.moved         ? 1 : 0);
+    data.moved         ? 1 : 0,
+    data.tiltDeg,
+    data.pressureHpa);
 
   if (n <= 0 || (size_t)n >= sizeof(q)) {
     Serial.println(F("[Upload] query build failed"));

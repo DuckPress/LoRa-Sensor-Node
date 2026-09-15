@@ -125,7 +125,10 @@ static size_t buildPayload(char* buf, size_t bufSize,
       "\"sd\":%.2f,"
       "\"n\":%u,"
       "\"sm\":%d,"
-      "\"mv\":%d",         // NOTE: object intentionally left open — see below
+      "\"mv\":%d,"
+      "\"tl\":%.1f,"       // tilt from vertical (deg), -1 = no LIS2DW12
+      "\"pr\":%.1f",       // station pressure (hPa), -1 = no barometer
+                           // NOTE: object intentionally left open — see below
     data.isoTimestamp,
     data.distanceValid ? data.distanceCm   : -1.0f,
     data.distanceValid ? data.distanceRaw  : -1.0f,
@@ -141,7 +144,9 @@ static size_t buildPayload(char* buf, size_t bufSize,
     data.burstSd,
     (unsigned)data.burstN,
     data.surveyMode    ? 1 : 0,
-    data.moved         ? 1 : 0);
+    data.moved         ? 1 : 0,
+    data.tiltDeg,
+    data.pressureHpa);
 
   if (n <= 0 || (size_t)n >= bufSize) {
     Serial.println(F("[LoRa] Payload truncated!"));

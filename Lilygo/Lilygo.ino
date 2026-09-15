@@ -35,6 +35,8 @@
 #include "lora_comms.h"
 #include "ota_updater.h"
 #include "pending.h"
+#include "crashlog.h"      // stage breadcrumbs + core-dump summary capture (H2)
+#include <esp_sleep.h>
 
 #include <SPI.h>
 #include <WiFi.h>
@@ -184,6 +186,11 @@ static void enterDeepSleep(uint64_t sleepUs) {
                 (unsigned long)s_wakeCount,
                 (unsigned long)s_lastSleepSecs);
   Serial.flush();
+  crashStageSet(STAGE_SLEEP);
+  // Arm the accelerometer's wake-up interrupt BEFORE the I2C bus is released
+  // (no-op when no LIS2DW12 / PIN_TILT_INT is fitted). The timer wake below
+  // stays armed too — whichever fires first wakes the node.
+  tiltArmMotionWake();
   shutdownPeripherals();
   esp_deep_sleep(sleepUs);
 }
@@ -256,6 +263,13 @@ void setup() {
   // it also explains the s_wakeCount/seq resets seen in the logs.
   esp_reset_reason_t resetReason = esp_reset_reason();
   Serial.printf("[Boot] reset reason: %s\n", resetReasonStr(resetReason));
+  // Stage breadcrumb: what was the previous run doing when it reset? (RTC
+  // NOINIT memory, so it survives a panic/watchdog reset.) Also re-arms the
+  // crumb for this run. Used in the bootlog line and the crash summary.
+  uint8_t prevStage = crashBootBegin(resetReason);
+  // Motion wake: the LIS2DW12 INT1 line pulled the node out of deep sleep.
+  bool motionWake = (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0);
+  if (motionWake) Serial.println(F("[Boot] Woken by tilt/motion interrupt"));
 
   // ---- Boot-loop detection ----
   // Count this reboot in NVS (survives the brownout/panic that wipes RTC RAM)
@@ -314,8 +328,10 @@ void setup() {
   // ---- Sensors ----
   // Notify the Kalman filter about the actual previous sleep duration so
   // it can scale process noise Q correctly before the first readAllSensors().
+  crashStageSet(STAGE_SENSORS_INIT);
   sensorsSetSleepDuration(s_lastSleepSecs);
   sensorsSetSurveyMode(s_surveyMode);   // long radar burst + QC tag when on
+  sensorsSetMotionWake(motionWake);     // flags this reading moved=1 if INT1 woke us
   sensorsInit();                        // auto-detects the connected sensor
   esp_task_wdt_reset();
 
@@ -325,6 +341,7 @@ void setup() {
   displaySplash("SENSOR " FIRMWARE_VERSION, sensorTypeName(sensorsActiveType()));
 
   // ---- SD ----
+  crashStageSet(STAGE_SD_INIT);
   sdInit();
   // A reset clears RTC RAM. Restore the recovery state with one SD scan; on
   // ordinary deep-sleep wakes the flag avoids repeatedly scanning the queue.
@@ -336,6 +353,7 @@ void setup() {
   // carries no secrets. secretsLoad() is safe even if the SD didn't mount — it
   // falls back to the NVS cache, then to "no secrets" (skips WiFi, drops the
   // LoRa token) without faulting.
+  crashStageSet(STAGE_SECRETS);
   secretsLoad();
 
   // ---- Early battery check ----
@@ -354,6 +372,7 @@ void setup() {
   } else if (batCritical) {
     Serial.printf("[WARN] Low battery %.2fV — skipping LoRa init\n", earlyBatV);
   } else {
+    crashStageSet(STAGE_LORA_INIT);
     displaySplash("SENSOR " FIRMWARE_VERSION, "LoRa init...");
     loraOk = loraInit();
   }
@@ -361,6 +380,7 @@ void setup() {
   // ================================================================
   //  Read all sensors
   // ================================================================
+  crashStageSet(STAGE_READ_SENSORS);
   displaySplash("SENSOR " FIRMWARE_VERSION, "Reading...");
   SensorData       data;
   SensorReadResult result = readAllSensors(data);
@@ -430,14 +450,25 @@ void setup() {
   //  SD log — written every wake, before the battery cutoff check,
   //  so low-bat events are always captured for later analysis.
   // ================================================================
+  crashStageSet(STAGE_SD_LOG);
   bool logged = sdLog(data, s_wakeCount, s_lastWifiRssi);
   if (!logged) Serial.println(F("[WARN] SD log failed"));
 
   // Record real reboots (not deep-sleep wakes) to /bootlog.csv with this wake's
   // timestamp, so brownouts/panics during unattended runs are visible later.
+  // The reason carries the previous run's stage ("PANIC@LORA_TX") when known.
   if (resetReason != ESP_RST_DEEPSLEEP) {
-    sdLogBootEvent(resetReasonStr(resetReason), s_wakeCount, data.isoTimestamp);
+    char reasonStage[40];
+    if (prevStage != STAGE_NONE && prevStage != STAGE_SLEEP)
+      snprintf(reasonStage, sizeof(reasonStage), "%s@%s", resetReasonStr(resetReason), crashStageName(prevStage));
+    else
+      snprintf(reasonStage, sizeof(reasonStage), "%s", resetReasonStr(resetReason));
+    sdLogBootEvent(reasonStage, s_wakeCount, data.isoTimestamp);
   }
+  // A core dump from a past panic waits in flash until a WiFi wake uploads it;
+  // write its summary to the SD card now (once) so it survives even if WiFi
+  // never comes — SD-first, like every other record on this node.
+  crashLogToSdOnce(data.isoTimestamp, s_wakeCount);
 
   // ================================================================
   //  Battery cutoff
@@ -515,6 +546,7 @@ void setup() {
     // the root-cause fix for the sheet stalling on an 8-minute -1 run. (C1)
     if (!result.distanceOk)
       Serial.println(F("[LoRa] Distance invalid — TX anyway as a flagged reading"));
+    crashStageSet(STAGE_LORA_TX);
     esp_task_wdt_reset();
     LoRaSendResult res = loraSend(data, s_lastWifiRssi);
     esp_task_wdt_reset();
@@ -568,6 +600,7 @@ void setup() {
   if (s_safeMode) {
     Serial.println(F("[SafeMode] Skipping WiFi/OTA/flush (radio off for recovery)"));
   } else if (isWifiWake || isOtaWake) {
+    crashStageSet(STAGE_WIFI_CONNECT);
     displaySplash("SENSOR " FIRMWARE_VERSION, "WiFi...");
     esp_task_wdt_reset();
     bool wifiOk = wifiConnect();
@@ -584,6 +617,7 @@ void setup() {
       // then RTC_TZ_OFFSET_SEC is added explicitly before writing the RTC. This
       // mirrors the gateway's formatIsoLocal() so node_ts and gw_ts share one
       // convention.
+      crashStageSet(STAGE_NTP);
       configTime(0, 0, NTP_SERVER1, NTP_SERVER2);   // UTC epoch; local shift applied below
       uint32_t ntpStart = millis();
       time_t   nowUtc   = 0;
@@ -611,6 +645,7 @@ void setup() {
       // just keeps the current settings — never flips them.
       bool otaRequested = false;
       {
+        crashStageSet(STAGE_NODECFG);
         // Report the running firmware version (fw=) so the cloud can confirm an
         // OTA landed — the node→GAS nodecfg poll happens every WiFi wake and needs
         // no gateway involvement, so version visibility doesn't depend on LoRa.
@@ -635,14 +670,25 @@ void setup() {
           if (s_pauseFlush) Serial.println(F("[Config] pause_flush ON — backlog flush held"));
           if (s_flushCap)   Serial.printf("[Config] flush_cap = %lu this wake\n",
                                           (unsigned long)s_flushCap);
+          // One-shot: the operator re-levelled the gauge — forget the tilt
+          // baseline so the next read captures the new installed orientation.
+          if (cfgBody.indexOf("\"tr\":1") >= 0) tiltResetBaseline();
         }
         esp_task_wdt_reset();
       }
+
+      // ---- Crash report (H2) ----
+      // If a panic left a core dump in flash, send its summary now (same
+      // connection) and erase it. Before the first WiFi wake it already sits in
+      // /crashlog.csv on the SD card.
+      crashUploadIfAny(data.isoTimestamp);
+      esp_task_wdt_reset();
 
       // A remote OTA request is serviced on this WiFi wake rather than waiting
       // for the periodic OTA schedule. A sleeping node cannot be woken over
       // the internet, so the response is bounded by the WiFi wake period.
       if (isOtaWake || otaRequested) {
+        crashStageSet(STAGE_OTA);
         displaySplash("SENSOR " FIRMWARE_VERSION, "OTA check...");
         otaInit();
         esp_task_wdt_reset();
@@ -661,6 +707,7 @@ void setup() {
         // load) so a big queue can't brown out a depleted cell. s_flushCap is a
         // remote hard cap (0 = auto). pause_flush skips draining entirely.
         uint32_t flushed = 0;
+        crashStageSet(STAGE_WIFI_FLUSH);
         if (s_pauseFlush) {
           Serial.println(F("[Pending] Flush paused by remote config"));
         } else {
@@ -677,6 +724,7 @@ void setup() {
         // confirm delivery — otherwise the gateway is already forwarding it
         // and a direct upload would just double-hit GAS.
         if (loraStatus != 1) {   // (C1) back up even a distance-flagged reading
+          crashStageSet(STAGE_UPLOAD);
           if (backlogAtStart || s_backlogPending) {
             pendingAppend(data);
             s_backlogPending = true;
@@ -730,6 +778,7 @@ void setup() {
   if (!s_safeMode && loraStatus == 1 && !wifiFlushed && !s_pauseFlush &&
       s_backlogPending) {
     esp_task_wdt_reset();
+    crashStageSet(STAGE_LORA_FLUSH);
     uint32_t loraFlushed = loraFlushPending(earlyBatV);
     esp_task_wdt_reset();
     if (loraFlushed > 0) {
@@ -746,6 +795,7 @@ void setup() {
                         ? WIFI_UPLOAD_EVERY_N
                         : WIFI_UPLOAD_EVERY_N - (s_wakeCount % WIFI_UPLOAD_EVERY_N);
 
+  crashStageSet(STAGE_DISPLAY);
   displayData(data, sdReady(), loraStatus, wifiStatus, s_wakeCount, nextWifiIn);
   // Hold long enough to read only when the panel is actually on (watched
   // wake); otherwise there's nothing to see, so keep the wake brief to save

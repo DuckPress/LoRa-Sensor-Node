@@ -4,6 +4,8 @@
 #include <SHT31.h>          // Rob Tillaart SHT31 library v0.5+
 #include <RTClib.h>         // Adafruit RTClib
 #include <esp_task_wdt.h>
+#include <esp_sleep.h>      // ext0 motion wake (LIS2DW12 INT1)
+#include <Preferences.h>    // NVS tilt baseline
 #include <string.h>         // memcpy (LD2413 frame parse)
 
 // ================================================================
@@ -13,6 +15,9 @@
 //  onboard OLED (GPIO17/18) which is internal-only.
 // ================================================================
 static TwoWire    I2CSensors(1);
+// Optional runtime-detected sensors (defined further down; used by sensorsInit)
+static bool tiltProbe();
+static bool baroProbe();
 static SHT31      sht(SHT3X_ADDR, &I2CSensors);
 static RTC_DS3231 rtc;
 
@@ -383,6 +388,9 @@ void sensorsInit() {
   } else {
     Serial.println(F("[Sensor] SHT3x OK"));
   }
+  // Optional, runtime-detected extras — absent is normal, not an error.
+  Serial.printf("[Sensor] LIS2DW12 tilt: %s   BMP/BME280 baro: %s\n",
+                tiltProbe() ? "present" : "absent", baroProbe() ? "present" : "absent");
 
   if (!rtc.begin(&I2CSensors)) {
     Serial.println(F("[Sensor] WARNING: DS3231 not found"));
@@ -726,65 +734,107 @@ static SensorType sensorsDetect() {
 }
 
 // ================================================================
-//  Optional LIS2DW12 mount-tilt monitoring (Wire1, 0x19)
+//  Optional LIS2DW12 mount-tilt monitoring (Wire1, 0x19/0x18) — RUNTIME-DETECTED
 //
 //  Detects whether the gauge has moved from its installed orientation — a
 //  shifted reference silently biases every reduced depth in a survey. The
-//  installed tilt is captured as a baseline on the first read after a cold
-//  boot (RTC RAM); a later change beyond TILT_MOVED_DEG raises the flag.
-//  UNVERIFIED on hardware — bench-test before trusting it. See config.h.
+//  installed tilt is captured as a baseline on the first read and persisted
+//  in NVS; a later change beyond TILT_MOVED_DEG raises the "moved" flag. The
+//  tilt angle itself is reported (tl=) for cosine-correcting the radar range.
+//  With PIN_TILT_INT wired, the sensor's wake-up interrupt also wakes the
+//  node from deep sleep on a knock/tilt (see tiltArmMotionWake()).
 // ================================================================
-#if defined(ENABLE_TILT_LIS2DW12)
-RTC_DATA_ATTR static float s_tiltBaselineDeg = -1.0f;
+static bool    s_tiltProbed  = false;
+static bool    s_tiltPresent = false;
+static uint8_t s_tiltAddr    = LIS2DW12_ADDR;
+static bool    s_motionWake  = false;
+static float   s_tiltBaselineDeg = -1.0f;     // loaded from NVS on first use
+static bool    s_tiltBaselineLoaded = false;
 
 static bool lis2dw12ReadReg(uint8_t reg, uint8_t* buf, uint8_t len) {
-  I2CSensors.beginTransmission(LIS2DW12_ADDR);
+  I2CSensors.beginTransmission(s_tiltAddr);
   I2CSensors.write(reg);
   if (I2CSensors.endTransmission(false) != 0) return false;   // repeated start
-  if (I2CSensors.requestFrom((int)LIS2DW12_ADDR, (int)len) != (int)len) return false;
+  if (I2CSensors.requestFrom((int)s_tiltAddr, (int)len) != (int)len) return false;
   for (uint8_t i = 0; i < len; i++) buf[i] = (uint8_t)I2CSensors.read();
   return true;
 }
 
 static bool lis2dw12WriteReg(uint8_t reg, uint8_t val) {
-  I2CSensors.beginTransmission(LIS2DW12_ADDR);
+  I2CSensors.beginTransmission(s_tiltAddr);
   I2CSensors.write(reg); I2CSensors.write(val);
   return I2CSensors.endTransmission() == 0;
 }
 
-// Read the three accelerometer axes (g, ±2g). Returns false if the device is
-// absent or isn't a LIS2DW12. Registers: WHO_AM_I 0x0F (=0x44), CTRL6 0x25
-// (full scale), CTRL1 0x20 (ODR/mode), OUT_X_L..OUT_Z_H 0x28..0x2D
-// (auto-incremented; IF_ADD_INC is on by default).
+// Probe both addresses once per wake (WHO_AM_I 0x0F == 0x44).
+static bool tiltProbe() {
+  if (s_tiltProbed) return s_tiltPresent;
+  s_tiltProbed = true;
+  const uint8_t addrs[2] = { LIS2DW12_ADDR, LIS2DW12_ADDR_ALT };
+  for (uint8_t i = 0; i < 2; i++) {
+    s_tiltAddr = addrs[i];
+    uint8_t who = 0;
+    if (lis2dw12ReadReg(0x0F, &who, 1) && who == 0x44) { s_tiltPresent = true; break; }
+  }
+  if (!s_tiltPresent) s_tiltAddr = LIS2DW12_ADDR;
+  return s_tiltPresent;
+}
+
+bool tiltPresent() { return tiltProbe(); }
+void sensorsSetMotionWake(bool motion) { s_motionWake = motion; }
+
+// Read the three accelerometer axes (g, ±2g). Registers: CTRL6 0x25 (full
+// scale), CTRL1 0x20 (ODR/mode), OUT_X_L..OUT_Z_H 0x28..0x2D (auto-increment).
 static bool lis2dw12Read(float& ax, float& ay, float& az) {
-  uint8_t who;
-  if (!lis2dw12ReadReg(0x0F, &who, 1) || who != 0x44) return false;  // WHO_AM_I
+  if (!tiltProbe()) return false;
   lis2dw12WriteReg(0x25, 0x00);   // CTRL6: ±2g full scale
   lis2dw12WriteReg(0x20, 0x24);   // CTRL1: 12.5 Hz, high-performance → measuring
   delay(100);                     // let at least one 12.5 Hz sample be produced
   uint8_t d[6];
   bool ok = lis2dw12ReadReg(0x28, d, 6);
-  lis2dw12WriteReg(0x20, 0x00);   // back to power-down (µA draw during sleep)
+  lis2dw12WriteReg(0x20, 0x00);   // power-down for the rest of the wake (re-armed before sleep)
   if (!ok) return false;
   int16_t x = (int16_t)(d[0] | (d[1] << 8));
   int16_t y = (int16_t)(d[2] | (d[3] << 8));
   int16_t z = (int16_t)(d[4] | (d[5] << 8));
-  // Data is left-justified in the 16-bit registers; at ±2g full scale that is
-  // 16384 LSB per g regardless of 12-/14-bit resolution.
+  // Left-justified 16-bit at ±2g: 16384 LSB per g regardless of 12/14-bit mode.
   ax = x / 16384.0f; ay = y / 16384.0f; az = z / 16384.0f;
   return true;
 }
 
-// True if the gauge has tilted more than TILT_MOVED_DEG from its baseline.
-static bool readMountMoved() {
+// Tilt from vertical (deg), -1 if the sensor is absent/unreadable.
+static float readTiltDeg() {
   float ax, ay, az;
-  if (!lis2dw12Read(ax, ay, az)) return false;      // sensor absent → assume ok
+  if (!lis2dw12Read(ax, ay, az)) return -1.0f;
   float mag = sqrtf(ax * ax + ay * ay + az * az);
-  if (mag < 0.1f) return false;
+  if (mag < 0.1f) return -1.0f;
   float c = az / mag; if (c > 1.0f) c = 1.0f; if (c < -1.0f) c = -1.0f;
-  float ang = acosf(c) * 57.2957795f;               // tilt from vertical (deg)
-  if (s_tiltBaselineDeg < 0.0f) {                   // first boot → set baseline
+  return acosf(c) * 57.2957795f;
+}
+
+static void tiltLoadBaseline() {
+  if (s_tiltBaselineLoaded) return;
+  Preferences p; p.begin("tilt", true);
+  s_tiltBaselineDeg = p.getFloat("base", -1.0f);
+  p.end();
+  s_tiltBaselineLoaded = true;
+}
+
+void tiltResetBaseline() {
+  Preferences p; p.begin("tilt", false);
+  p.remove("base");
+  p.end();
+  s_tiltBaselineDeg = -1.0f; s_tiltBaselineLoaded = true;
+  Serial.println(F("[Tilt] Baseline cleared — next read sets a new one"));
+}
+
+// True if the gauge has tilted more than TILT_MOVED_DEG from its baseline.
+static bool tiltMoved(float ang) {
+  if (ang < 0.0f) return false;                       // sensor absent → assume ok
+  tiltLoadBaseline();
+  if (s_tiltBaselineDeg < 0.0f) {                     // first read → set baseline
     s_tiltBaselineDeg = ang;
+    Preferences p; p.begin("tilt", false); p.putFloat("base", ang); p.end();
     Serial.printf("[Tilt] Baseline set: %.2f deg\n", ang);
     return false;
   }
@@ -793,7 +843,123 @@ static bool readMountMoved() {
                 ang, s_tiltBaselineDeg, moved ? "  *** MOVED ***" : "");
   return moved;
 }
-#endif  // ENABLE_TILT_LIS2DW12
+
+// Arm the wake-up interrupt for deep sleep. LIS2DW12 registers: CTRL1 0x20
+// (ODR 1.6 Hz low-power = 0x10), CTRL3 0x22 (LIR latch = 0x10), CTRL4 0x23
+// (INT1_WU = 0x20), WAKE_UP_THS 0x34, WAKE_UP_DUR 0x35, CTRL7 0x3F
+// (INTERRUPTS_ENABLE = 0x20). INT1 is push-pull active-high by default.
+bool tiltArmMotionWake() {
+  if (PIN_TILT_INT < 0 || !tiltProbe()) return false;
+  uint8_t src;
+  lis2dw12ReadReg(0x38, &src, 1);                     // WAKE_UP_SRC: clear a latched event
+  bool ok = true;
+  ok &= lis2dw12WriteReg(0x25, 0x00);
+  ok &= lis2dw12WriteReg(0x22, 0x10);                 // latched interrupt
+  ok &= lis2dw12WriteReg(0x34, TILT_WAKE_THS_LSB & 0x3F);
+  ok &= lis2dw12WriteReg(0x35, 0x00);
+  ok &= lis2dw12WriteReg(0x23, 0x20);                 // route wake-up to INT1
+  ok &= lis2dw12WriteReg(0x3F, 0x20);                 // enable interrupts
+  ok &= lis2dw12WriteReg(0x20, 0x10);                 // 1.6 Hz low-power, keeps running in sleep
+  if (!ok) { Serial.println(F("[Tilt] Motion-wake arm failed")); return false; }
+  pinMode((uint8_t)PIN_TILT_INT, INPUT_PULLDOWN);
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_TILT_INT, 1);
+  Serial.printf("[Tilt] Motion wake armed on GPIO%d\n", (int)PIN_TILT_INT);
+  return true;
+}
+
+// ================================================================
+//  Optional BMP280 / BME280 barometer (Wire1, 0x76/0x77) — RUNTIME-DETECTED
+//  Forced-mode single measurement per wake; Bosch integer compensation.
+// ================================================================
+static bool     s_baroProbed  = false;
+static bool     s_baroPresent = false;
+static uint8_t  s_baroAddr    = BARO_ADDR;
+static uint8_t  s_baroChipId  = 0;
+static struct { uint16_t T1; int16_t T2, T3; uint16_t P1; int16_t P2, P3, P4, P5, P6, P7, P8, P9; } s_baroCal;
+
+static bool baroReadRegs(uint8_t reg, uint8_t* buf, uint8_t len) {
+  I2CSensors.beginTransmission(s_baroAddr);
+  I2CSensors.write(reg);
+  if (I2CSensors.endTransmission(false) != 0) return false;
+  if (I2CSensors.requestFrom((int)s_baroAddr, (int)len) != (int)len) return false;
+  for (uint8_t i = 0; i < len; i++) buf[i] = (uint8_t)I2CSensors.read();
+  return true;
+}
+static bool baroWriteReg(uint8_t reg, uint8_t val) {
+  I2CSensors.beginTransmission(s_baroAddr);
+  I2CSensors.write(reg); I2CSensors.write(val);
+  return I2CSensors.endTransmission() == 0;
+}
+
+static bool baroProbe() {
+  if (s_baroProbed) return s_baroPresent;
+  s_baroProbed = true;
+  const uint8_t addrs[2] = { BARO_ADDR, BARO_ADDR_ALT };
+  for (uint8_t i = 0; i < 2 && !s_baroPresent; i++) {
+    s_baroAddr = addrs[i];
+    uint8_t id = 0;
+    if (!baroReadRegs(0xD0, &id, 1)) continue;
+    if (id == 0x58 || id == 0x60 || id == 0x56 || id == 0x57) {   // BMP280 / BME280 / BMP280 samples
+      uint8_t c[24];
+      if (!baroReadRegs(0x88, c, 24)) continue;
+      s_baroCal.T1 = (uint16_t)(c[0]  | (c[1]  << 8));
+      s_baroCal.T2 = (int16_t) (c[2]  | (c[3]  << 8));
+      s_baroCal.T3 = (int16_t) (c[4]  | (c[5]  << 8));
+      s_baroCal.P1 = (uint16_t)(c[6]  | (c[7]  << 8));
+      s_baroCal.P2 = (int16_t) (c[8]  | (c[9]  << 8));
+      s_baroCal.P3 = (int16_t) (c[10] | (c[11] << 8));
+      s_baroCal.P4 = (int16_t) (c[12] | (c[13] << 8));
+      s_baroCal.P5 = (int16_t) (c[14] | (c[15] << 8));
+      s_baroCal.P6 = (int16_t) (c[16] | (c[17] << 8));
+      s_baroCal.P7 = (int16_t) (c[18] | (c[19] << 8));
+      s_baroCal.P8 = (int16_t) (c[20] | (c[21] << 8));
+      s_baroCal.P9 = (int16_t) (c[22] | (c[23] << 8));
+      s_baroChipId  = id;
+      s_baroPresent = true;
+    }
+  }
+  if (!s_baroPresent) s_baroAddr = BARO_ADDR;
+  return s_baroPresent;
+}
+
+bool baroPresent() { return baroProbe(); }
+
+// Station pressure in hPa, -1 if absent/unreadable. One forced conversion
+// (temperature + pressure, oversampling ×1): ~6 ms, then back to sleep mode.
+static float readPressureHpa() {
+  if (!baroProbe()) return -1.0f;
+  if (s_baroChipId == 0x60) baroWriteReg(0xF2, 0x00);   // BME280: humidity off (must precede ctrl_meas)
+  if (!baroWriteReg(0xF4, 0x25)) return -1.0f;          // osrs_t=1, osrs_p=1, forced
+  uint8_t st = 0x08;
+  for (uint8_t i = 0; i < 10 && (st & 0x08); i++) { delay(3); baroReadRegs(0xF3, &st, 1); }
+  uint8_t d[6];
+  if (!baroReadRegs(0xF7, d, 6)) return -1.0f;
+  int32_t adcP = ((int32_t)d[0] << 12) | ((int32_t)d[1] << 4) | (d[2] >> 4);
+  int32_t adcT = ((int32_t)d[3] << 12) | ((int32_t)d[4] << 4) | (d[5] >> 4);
+  if (adcP == 0x80000 || adcT == 0x80000) return -1.0f;   // conversion not run
+
+  // Bosch reference compensation (BMP280 datasheet §3.11.3), 32/64-bit integer.
+  int32_t var1 = ((((adcT >> 3) - ((int32_t)s_baroCal.T1 << 1))) * ((int32_t)s_baroCal.T2)) >> 11;
+  int32_t var2 = (((((adcT >> 4) - ((int32_t)s_baroCal.T1)) * ((adcT >> 4) - ((int32_t)s_baroCal.T1))) >> 12) *
+                  ((int32_t)s_baroCal.T3)) >> 14;
+  int32_t tFine = var1 + var2;
+
+  int64_t v1 = ((int64_t)tFine) - 128000;
+  int64_t v2 = v1 * v1 * (int64_t)s_baroCal.P6;
+  v2 = v2 + ((v1 * (int64_t)s_baroCal.P5) << 17);
+  v2 = v2 + (((int64_t)s_baroCal.P4) << 35);
+  v1 = ((v1 * v1 * (int64_t)s_baroCal.P3) >> 8) + ((v1 * (int64_t)s_baroCal.P2) << 12);
+  v1 = (((((int64_t)1) << 47) + v1)) * ((int64_t)s_baroCal.P1) >> 33;
+  if (v1 == 0) return -1.0f;
+  int64_t p = 1048576 - adcP;
+  p = (((p << 31) - v2) * 3125) / v1;
+  v1 = (((int64_t)s_baroCal.P9) * (p >> 13) * (p >> 13)) >> 25;
+  v2 = (((int64_t)s_baroCal.P8) * p) >> 19;
+  p = ((p + v1 + v2) >> 8) + (((int64_t)s_baroCal.P7) << 4);
+  float hpa = (float)p / 256.0f / 100.0f;
+  if (hpa < 300.0f || hpa > 1100.0f) return -1.0f;
+  return hpa;
+}
 
 // ================================================================
 //  getBatteryVoltage — averaged, calibrated LiPo voltage (V) at the cell.
@@ -947,9 +1113,14 @@ SensorReadResult readAllSensors(SensorData& out) {
   out.burstSd    = g_burstSd;
   out.burstN     = g_burstN;
   out.surveyMode = s_surveyMode;
-#if defined(ENABLE_TILT_LIS2DW12)
-  out.moved      = readMountMoved();   // mount-integrity check (survey QA)
-#endif
+  // Mount integrity + tilt angle (LIS2DW12, if fitted). A motion-interrupt wake
+  // counts as "moved" for this reading even if the static tilt settled back.
+  out.tiltDeg    = readTiltDeg();
+  out.moved      = tiltMoved(out.tiltDeg) || s_motionWake;
+  if (s_motionWake) Serial.println(F("[Tilt] Woken by motion interrupt — flagged moved=1"));
+  // Station pressure (BMP280/BME280, if fitted).
+  out.pressureHpa = readPressureHpa();
+  if (out.pressureHpa > 0.0f) Serial.printf("[Baro] %.1f hPa\n", out.pressureHpa);
 
   if (out.distanceValid) {
     out.distanceCm = kalmanUpdate(rawDist, g_burstSd);

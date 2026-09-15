@@ -95,13 +95,13 @@ bool sdLog(const SensorData& data, uint32_t wakeCount, int32_t wifiRssi) {
   // CSV columns match LOG_HEADER in config.h:
   // timestamp, rtc_valid, dist_raw_cm, dist_kalman_cm, water_level_cm,
   // temp_c, humidity_pct, bat_v, wifi_rssi, wake_count,
-  // burst_sd_cm, burst_n, survey_mode, mount_moved
+  // burst_sd_cm, burst_n, survey_mode, mount_moved, tilt_deg, pressure_hpa
   //
   // Format the row first so a SHORT write (card full mid-row) is detected —
   // comparing only against 0 would call a truncated row a success.
-  char row[232];
+  char row[256];
   int len = snprintf(row, sizeof(row),
-    "%s,%d,%.2f,%.2f,%.2f,%.2f,%.1f,%.2f,%ld,%lu,%.2f,%u,%d,%d\n",
+    "%s,%d,%.2f,%.2f,%.2f,%.2f,%.1f,%.2f,%ld,%lu,%.2f,%u,%d,%d,%.1f,%.1f\n",
     data.isoTimestamp,
     data.rtcValid      ? 1    : 0,
     data.distanceValid ? data.distanceRaw  : -1.0f,
@@ -115,7 +115,9 @@ bool sdLog(const SensorData& data, uint32_t wakeCount, int32_t wifiRssi) {
     data.burstSd,
     (unsigned)data.burstN,
     data.surveyMode    ? 1 : 0,
-    data.moved         ? 1 : 0);
+    data.moved         ? 1 : 0,
+    data.tiltDeg,                     // -1 = no tilt sensor
+    data.pressureHpa);                // -1 = no barometer
   if (len <= 0 || (size_t)len >= sizeof(row)) {
     f.close();
     Serial.println(F("[SD] Row format failed"));
@@ -155,5 +157,23 @@ bool sdLogBootEvent(const char* reason, uint32_t wakeCount, const char* isoTs) {
   f.printf("%s,%lu,%s\n", isoTs, (unsigned long)wakeCount, reason);
   f.close();
   Serial.printf("[Boot] logged reset '%s' to %s\n", reason, BOOTLOG_FILENAME);
+  return true;
+}
+
+// ================================================================
+//  sdLogCrashEvent — one core-dump summary per line in /crashlog.csv
+// ================================================================
+bool sdLogCrashEvent(const char* isoTs, uint32_t wakeCount, const char* summaryCsv) {
+  if (!s_sdReady) return false;
+  bool fresh = !SD.exists(CRASHLOG_FILENAME);
+  File f = SD.open(CRASHLOG_FILENAME, FILE_APPEND);
+  if (!f) {
+    Serial.println(F("[SD] crashlog open failed"));
+    return false;
+  }
+  if (fresh) f.print(F("timestamp,wake_count,reset_reason,stage,exc_cause,exc_name,task,backtrace_status,pc,backtrace,elf_sha\n"));
+  f.printf("%s,%lu,%s\n", isoTs ? isoTs : "", (unsigned long)wakeCount, summaryCsv);
+  f.close();
+  Serial.printf("[Crash] summary logged to %s\n", CRASHLOG_FILENAME);
   return true;
 }

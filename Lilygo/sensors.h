@@ -57,8 +57,12 @@ struct SensorData {
 
   // Mount integrity: true if the optional tilt sensor detects the gauge has
   // moved from its installed baseline (a shifted reference silently biases
-  // every reduced depth in a survey). Always false when tilt is not enabled.
+  // every reduced depth in a survey). Always false when no tilt sensor is fitted.
   bool     moved = false;
+  // Tilt from vertical (deg) from the LIS2DW12; -1 when the sensor is absent.
+  float    tiltDeg = -1.0f;
+  // Station air pressure (hPa) from the BMP280/BME280; -1 when absent.
+  float    pressureHpa = -1.0f;
 
   // Freshness — set to millis() at end of readAllSensors()
   uint32_t capturedAtMs = 0;
@@ -112,3 +116,16 @@ bool             rtcSyncIfDrifted(uint32_t localEpoch, int32_t maxSkewSec);  // 
 // End Wire1 (sensor I2C bus) before deep sleep to stop current leaking
 // through the pull-up resistors.
 void             sensorsShutdown();
+
+// ---- Optional tilt (LIS2DW12) / barometer (BMP280/BME280), runtime-detected ----
+bool tiltPresent();            // valid after sensorsInit()
+bool baroPresent();
+void tiltResetBaseline();      // forget the installed baseline (re-levelled)
+// Tell the sensor layer this wake was caused by the accelerometer's INT1 line
+// (motion wake); readAllSensors() then reports moved=1 for this reading.
+void sensorsSetMotionWake(bool motion);
+// Leave the LIS2DW12 running in low-power mode with its wake-up interrupt
+// armed, so a knock/tilt during deep sleep pulls PIN_TILT_INT high. Call
+// right before deep sleep (after the I2C bus is otherwise done). No-op when
+// the sensor is absent or PIN_TILT_INT < 0. Returns true if armed.
+bool tiltArmMotionWake();
