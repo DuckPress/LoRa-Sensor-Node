@@ -3,13 +3,16 @@
 
 // ----------------------------------------------------------------
 //  Distance-sensor type — which physical sensor a reading came from.
-//  All enabled drivers are compiled in; the active one is auto-detected
-//  at runtime (see sensorsDetect() / sensorsActiveType()).
+//  All enabled drivers are compiled in and EVERY one is detected
+//  independently at runtime; all present sensors are read each wake and
+//  the first valid one in preference order (radar, then ultrasonic) feeds
+//  the level pipeline (see sensorsInit() / sensorsActiveType()).
 // ----------------------------------------------------------------
 enum SensorType : uint8_t {
   SENSOR_TYPE_NONE = 0,
   SENSOR_TYPE_RCWL1670,
   SENSOR_TYPE_LD2413,
+  SENSOR_TYPE_COUNT        // number of entries above (array sizing only)
 };
 
 // ----------------------------------------------------------------
@@ -52,8 +55,19 @@ struct SensorData {
   // Carried in the payload/log so tide-reduction can identify survey data.
   bool     surveyMode = false;
 
-  // Which physical sensor produced this reading (auto-detected).
+  // Which physical sensor fed the level pipeline this wake (the PRIMARY):
+  // the radar when its burst was valid, else the ultrasonic. NONE when
+  // neither produced a reading.
   SensorType sensorType = SENSOR_TYPE_NONE;
+
+  // Dual-sensor build: BOTH distance sensors are read every wake. The primary
+  // (sensorType) is what distanceRaw/distanceCm/waterLevelCm came from; the
+  // per-sensor trimmed means are kept here so the two can be cross-checked in
+  // the log/cloud. -1 = that sensor is absent or its burst was empty.
+  float    distanceRadarCm = -1.0f;  // LD2413 trimmed mean (cm), true range
+  float    distanceUsCm    = -1.0f;  // RCWL-1670 trimmed mean (cm), speed-of-sound corrected
+  float    usBurstSd       = -1.0f;  // ultrasonic burst std-dev (cm), -1 = unknown
+  uint8_t  usBurstN        = 0;      // ultrasonic in-range sample count
 
   // Mount integrity: true if the optional tilt sensor detects the gauge has
   // moved from its installed baseline (a shifted reference silently biases
@@ -91,10 +105,16 @@ SensorReadResult readAllSensors(SensorData& out);
 float            getBatteryVoltage();       // cached per-wake resting value
 float            getBatteryVoltageFresh();  // uncached — for under-load sampling
 
-// The distance sensor auto-detected as connected this session (cached across
-// deep sleep). SENSOR_TYPE_NONE until the first detection completes.
+// The PRIMARY distance sensor for this wake: the first confirmed sensor in
+// preference order (LD2413 radar, then RCWL-1670 ultrasonic). Detection state
+// is cached across deep sleep; SENSOR_TYPE_NONE until a detection completes.
 SensorType       sensorsActiveType();
 const char*      sensorTypeName(SensorType t);
+// True if that sensor has been positively detected (confirmed) this session.
+bool             sensorPresent(SensorType t);
+// Short label of everything detected, e.g. "LD2413+RCWL-1670" (for the
+// splash/boot log). "NONE" if nothing has answered yet.
+const char*      sensorsPresentName();
 
 // Call once per wake, before readAllSensors(), with the duration of the
 // previous deep-sleep in seconds. The value accumulates until the Kalman

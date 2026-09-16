@@ -29,13 +29,36 @@ static void uartEnd() { if (s_uartBegun) { UartSensor.end(); s_uartBegun = false
 #endif
 
 // ================================================================
-//  Auto-detected active sensor — persists across deep sleep in RTC RAM.
-//  NONE (0) on a cold boot forces detection on wake #1; a confirmed type is
-//  reused on later wakes; SENSOR_REDETECT_FAILS bad reads force a re-detect.
+//  Auto-detected sensors — one slot per SensorType, persisted across deep
+//  sleep in RTC RAM. Every enabled driver is detected INDEPENDENTLY:
+//    s_confirmed[t]  — positively detected (probe answered, or a valid read)
+//    s_failStreak[t] — consecutive empty bursts from a confirmed sensor;
+//                      SENSOR_REDETECT_FAILS of them demote it to unconfirmed
+//    s_reprobeIn[t]  — wakes until an unconfirmed sensor is probed again.
+//                      0 on a cold boot → probed on wake #1; a failed probe
+//                      backs off SENSOR_ABSENT_REPROBE_WAKES so an absent
+//                      sensor doesn't cost a probe on every wake.
+//  ALL confirmed sensors are read each wake. The PRIMARY (s_activeType) is
+//  the first confirmed one in SENSOR_ORDER; it feeds the level pipeline, and
+//  the other sensor's reading travels alongside for cross-checking.
 // ================================================================
-RTC_DATA_ATTR static SensorType s_activeType    = SENSOR_TYPE_NONE;
-RTC_DATA_ATTR static bool       s_typeConfirmed = false;   // positively detected?
-RTC_DATA_ATTR static uint8_t    s_failStreak    = 0;       // consecutive invalid reads
+static const SensorType SENSOR_ORDER[] = {     // preference order
+#if defined(ENABLE_SENSOR_LD2413)
+  SENSOR_TYPE_LD2413,      // radar first: true range, no air correction
+#endif
+#if defined(ENABLE_SENSOR_RCWL1670)
+  SENSOR_TYPE_RCWL1670,
+#endif
+};
+constexpr uint8_t SENSOR_ORDER_N = sizeof(SENSOR_ORDER) / sizeof(SENSOR_ORDER[0]);
+
+RTC_DATA_ATTR static SensorType s_activeType = SENSOR_TYPE_NONE;
+RTC_DATA_ATTR static bool       s_confirmed[SENSOR_TYPE_COUNT]  = { false };
+RTC_DATA_ATTR static uint8_t    s_failStreak[SENSOR_TYPE_COUNT] = { 0 };
+RTC_DATA_ATTR static uint16_t   s_reprobeIn[SENSOR_TYPE_COUNT]  = { 0 };
+// Sensors to read THIS wake (the confirmed ones, plus the unconfirmed fallback
+// while nothing has been detected). Plain RAM — rebuilt by sensorsInit().
+static bool s_readThisWake[SENSOR_TYPE_COUNT] = { false };
 
 const char* sensorTypeName(SensorType t) {
   switch (t) {
@@ -45,11 +68,24 @@ const char* sensorTypeName(SensorType t) {
   }
 }
 SensorType sensorsActiveType() { return s_activeType; }
+bool sensorPresent(SensorType t) { return (t < SENSOR_TYPE_COUNT) && s_confirmed[t]; }
+
+const char* sensorsPresentName() {
+  static char buf[32];
+  buf[0] = '\0';
+  for (uint8_t i = 0; i < SENSOR_ORDER_N; i++) {
+    if (!s_confirmed[SENSOR_ORDER[i]]) continue;
+    size_t len = strlen(buf);
+    if (len) { strncat(buf, "+", sizeof(buf) - len - 1); len++; }
+    strncat(buf, sensorTypeName(SENSOR_ORDER[i]), sizeof(buf) - len - 1);
+  }
+  return buf[0] ? buf : "NONE";
+}
 
 // Forward declarations — definitions are lower in the file, next to the
 // per-sensor read code they depend on.
-static void       sensorBegin(SensorType t);
-static SensorType sensorsDetect();
+static void sensorBegin(SensorType t);
+static bool sensorProbe(SensorType t);
 
 // ================================================================
 //  Kalman filter state — persists across deep sleep in RTC RAM.
@@ -359,27 +395,56 @@ void sensorsInit() {
   // devices, so a wedged bus from a previous wake can't blind both sensors.
   i2cBusHealthCheck();
 
-  // --- Distance sensor: auto-detect on cold boot / after repeated read
-  //     failures; otherwise just bring up the cached one (no probe cost each
-  //     wake). sensorsDetect() leaves the detected sensor initialised. ---
-  if (!s_typeConfirmed) {
-    s_activeType = sensorsDetect();
-    if (s_activeType != SENSOR_TYPE_NONE) {
-      s_typeConfirmed = true;               // detected sensor is already begun
-    } else {
-      // Nothing answered — read with the fallback this wake so we still try to
-      // produce data, and keep re-detecting (stays unconfirmed) until one
-      // confirms (a valid read in readAllSensors promotes it).
-      s_activeType = SENSOR_DETECT_FALLBACK;
-      sensorBegin(s_activeType);
-      Serial.printf("[Sensor] Falling back to %s (unconfirmed)\n",
-                    sensorTypeName(s_activeType));
+  // --- Distance sensors: every enabled driver is detected independently.
+  //     A confirmed sensor is just brought up (no probe cost each wake); an
+  //     unconfirmed one is probed when its re-probe countdown reaches 0 — on
+  //     a cold boot that is every enabled sensor. Everything confirmed is read
+  //     this wake; the first in SENSOR_ORDER is the primary. ---
+  bool anyConfirmed = false;
+  bool begun[SENSOR_TYPE_COUNT] = { false };
+  for (uint8_t i = 0; i < SENSOR_ORDER_N; i++) {
+    const SensorType t = SENSOR_ORDER[i];
+    s_readThisWake[t] = false;
+    esp_task_wdt_reset();
+    if (s_confirmed[t]) {
+      sensorBegin(t); begun[t] = true;      // cached — just bring it up
+      s_readThisWake[t] = true; anyConfirmed = true;
+      Serial.printf("[Sensor] Using cached sensor: %s\n", sensorTypeName(t));
+      continue;
     }
-  } else {
-    sensorBegin(s_activeType);              // cached — just bring it up
-    Serial.printf("[Sensor] Using cached sensor: %s\n",
-                  sensorTypeName(s_activeType));
+    if (s_reprobeIn[t] > 0) {               // known absent — not due yet
+      s_reprobeIn[t]--;
+      continue;
+    }
+    sensorBegin(t); begun[t] = true;
+    if (sensorProbe(t)) {
+      s_confirmed[t] = true; s_failStreak[t] = 0;
+      s_readThisWake[t] = true; anyConfirmed = true;
+      Serial.printf("[Sensor] Detected: %s\n", sensorTypeName(t));
+    } else {
+      s_reprobeIn[t] = SENSOR_ABSENT_REPROBE_WAKES;
+      Serial.printf("[Sensor]  ...%s not responding (re-probe in %u wakes)\n",
+                    sensorTypeName(t), (unsigned)SENSOR_ABSENT_REPROBE_WAKES);
+    }
   }
+  if (!anyConfirmed) {
+    // Nothing answered — read with the fallback this wake so we still try to
+    // produce data, and keep probing it every wake until it confirms (a valid
+    // read in readAllSensors() promotes it).
+    const SensorType fb = SENSOR_DETECT_FALLBACK;
+    if (!begun[fb]) sensorBegin(fb);
+    s_reprobeIn[fb]    = 0;
+    s_readThisWake[fb] = true;
+    Serial.printf("[Sensor] No sensor positively detected — falling back to %s (unconfirmed)\n",
+                  sensorTypeName(fb));
+  }
+  // Primary = first confirmed sensor in preference order (else the fallback).
+  s_activeType = SENSOR_DETECT_FALLBACK;
+  for (uint8_t i = 0; i < SENSOR_ORDER_N; i++) {
+    if (s_confirmed[SENSOR_ORDER[i]]) { s_activeType = SENSOR_ORDER[i]; break; }
+  }
+  Serial.printf("[Sensor] Present: %s   primary: %s\n",
+                sensorsPresentName(), sensorTypeName(s_activeType));
 
   sht.begin();
   delay(15);
@@ -626,11 +691,9 @@ static void ld2413Configure() {
 //
 //  sensorBegin(t) — bring up the hardware for one sensor type so it can be
 //  probed or read. sensorProbe(t) — return true if that sensor responds.
-//  sensorsDetect() — probe the enabled sensors in order and return the first
-//  that answers (or NONE).
+//  sensorsInit() runs both for every enabled driver (each detected on its
+//  own — the sensors are on independent pins).
 // ================================================================
-static bool sensorProbe(SensorType t);
-
 static void sensorBegin(SensorType t) {
   switch (t) {
 #if defined(ENABLE_SENSOR_LD2413)
@@ -647,11 +710,11 @@ static void sensorBegin(SensorType t) {
         // Skip the boot-settle wait only with POSITIVE evidence the module
         // never lost power: no load-switch fitted (so sensorsShutdown()
         // never cut its supply) AND it was already confirmed running on an
-        // earlier wake — s_typeConfirmed only becomes true after a prior
+        // earlier wake — s_confirmed[] only becomes true after a prior
         // successful detection, so this can't fire on a true cold boot or
-        // during the initial auto-probe below, where the module's actual
-        // power-on timing is unknown and the settle time is still needed.
-        bool skipDelay = !hadSwitch && s_typeConfirmed;
+        // during the initial auto-probe, where the module's actual power-on
+        // timing is unknown and the settle time is still needed.
+        bool skipDelay = !hadSwitch && s_confirmed[SENSOR_TYPE_LD2413];
         if (!skipDelay) delay(LD2413_BOOT_MS);   // power-up → first data frame
         esp_task_wdt_reset();
       }
@@ -706,31 +769,6 @@ static bool sensorProbe(SensorType t) {
     default:
       return false;
   }
-}
-
-static SensorType sensorsDetect() {
-  Serial.println(F("[Sensor] Auto-detecting connected distance sensor..."));
-  // Probe order: LD2413 (radar, preferred) → RCWL. They are on independent
-  // pins, so the order is simply preference.
-  static const SensorType order[] = {
-#if defined(ENABLE_SENSOR_LD2413)
-    SENSOR_TYPE_LD2413,
-#endif
-#if defined(ENABLE_SENSOR_RCWL1670)
-    SENSOR_TYPE_RCWL1670,
-#endif
-  };
-  for (uint8_t i = 0; i < sizeof(order) / sizeof(order[0]); i++) {
-    esp_task_wdt_reset();
-    sensorBegin(order[i]);
-    if (sensorProbe(order[i])) {
-      Serial.printf("[Sensor] Detected: %s\n", sensorTypeName(order[i]));
-      return order[i];
-    }
-    Serial.printf("[Sensor]  ...%s not responding\n", sensorTypeName(order[i]));
-  }
-  Serial.println(F("[Sensor] No sensor positively detected"));
-  return SENSOR_TYPE_NONE;
 }
 
 // ================================================================
@@ -1042,47 +1080,107 @@ static bool readRTC(char* buf24, uint32_t& epochOut) {
 //  readAllSensors
 //
 //  Pipeline:
-//    1. Distance burst → trim each end → mean, dispatched at RUNTIME to the
-//       auto-detected sensor (ultrasonic pulses, or LD2413 radar frames)
+//    1. Distance bursts from EVERY sensor present this wake (LD2413 radar
+//       frames, RCWL-1670 ultrasonic pulses) → trim each end → mean, per sensor
 //    2. SHT3x reads temperature + humidity
-//    3. Speed-of-sound correct: corrected = raw × c(T,RH)/0.0343
+//    3. Speed-of-sound correct the ULTRASONIC: corrected = raw × c(T,RH)/0.0343
 //       Falls back to last good T/RH if the env sensor misses this wake.
-//       SKIPPED for the LD2413 radar (its range is temp/humidity-independent).
-//    4. corrected → 1-D Kalman (sleep-scaled Q, spike-gated) → distanceCm
+//       Not applied to the LD2413 radar (its range is temp/humidity-independent).
+//    4. Primary = first valid sensor in preference order (radar, then
+//       ultrasonic) → 1-D Kalman (sleep-scaled Q, spike-gated) → distanceCm.
+//       Both per-sensor values are kept on the reading for cross-checking.
 //    5. waterLevelCm = SENSOR_HEIGHT_CM − distanceCm
 // ================================================================
 SensorReadResult readAllSensors(SensorData& out) {
   SensorReadResult result;
 
-  // Step 1 — raw distance burst, dispatched by the auto-detected sensor.
-  float rawDist = -1.0f;
-  switch (s_activeType) {
-#if defined(ENABLE_SENSOR_RCWL1670)
-    case SENSOR_TYPE_RCWL1670: rawDist = readRCWL1670Raw(); break;
-#endif
+  // Step 1 — raw distance bursts from every sensor present this wake, kept
+  // per sensor so both reach the log/cloud. Each read leaves its QC stats in
+  // g_burstSd / g_burstN; capture them before the next sensor overwrites them.
+  float   raw[SENSOR_TYPE_COUNT];
+  float   sd [SENSOR_TYPE_COUNT];
+  uint8_t n  [SENSOR_TYPE_COUNT];
+  for (uint8_t t = 0; t < SENSOR_TYPE_COUNT; t++) { raw[t] = -1.0f; sd[t] = -1.0f; n[t] = 0; }
 #if defined(ENABLE_SENSOR_LD2413)
-    case SENSOR_TYPE_LD2413:   rawDist = readLD2413Raw();   break;
-#endif
-    default:                   g_burstSd = -1.0f; g_burstN = 0; break;  // NONE
+  if (s_readThisWake[SENSOR_TYPE_LD2413]) {
+    raw[SENSOR_TYPE_LD2413] = readLD2413Raw();
+    sd [SENSOR_TYPE_LD2413] = g_burstSd;
+    n  [SENSOR_TYPE_LD2413] = g_burstN;
+    esp_task_wdt_reset();
   }
-  out.sensorType = s_activeType;
-  esp_task_wdt_reset();
+#endif
+#if defined(ENABLE_SENSOR_RCWL1670)
+  if (s_readThisWake[SENSOR_TYPE_RCWL1670]) {
+    raw[SENSOR_TYPE_RCWL1670] = readRCWL1670Raw();
+    sd [SENSOR_TYPE_RCWL1670] = g_burstSd;
+    n  [SENSOR_TYPE_RCWL1670] = g_burstN;
+    esp_task_wdt_reset();
+  }
+#endif
 
   // Step 2 — environment sensor (still read for the payload/log, and — for the
-  // ultrasonics — for the speed-of-sound correction below)
+  // ultrasonic — for the speed-of-sound correction below)
   out.envValid = readSHT3x(out.tempC, out.humidity);
   result.envOk = out.envValid;
   if (out.envValid) { s_lastTempC = out.tempC; s_lastHumidity = out.humidity; }
 
   // Step 3 — speed-of-sound correction (temperature + humidity). Applied to
-  // the ULTRASONIC sensors, whose raw distance used a fixed 0.0343 cm/µs
-  // constant. The LD2413 RADAR reports a true range (speed of light), so it
-  // is skipped for it — decided at runtime from the active sensor type.
-  if (s_activeType != SENSOR_TYPE_LD2413 && rawDist > 0.0f) {
+  // the ULTRASONIC only, whose raw distance used a fixed 0.0343 cm/µs
+  // constant. The LD2413 RADAR reports a true range (speed of light).
+  if (raw[SENSOR_TYPE_RCWL1670] > 0.0f) {
     float factor = tempCompFactor(s_lastTempC, s_lastHumidity);
-    rawDist *= factor;
+    raw[SENSOR_TYPE_RCWL1670] *= factor;
     Serial.printf("[Sensor] SoS factor %.4f (T=%.1f C, RH=%.0f%%)\n",
                   factor, s_lastTempC, s_lastHumidity);
+  }
+
+  // Per-sensor bookkeeping: a valid burst confirms a sensor (promoting an
+  // unconfirmed fallback); SENSOR_REDETECT_FAILS consecutive empty bursts from
+  // a confirmed one demote it so it is probed afresh next wake (unplugged,
+  // failed, or swapped).
+  for (uint8_t i = 0; i < SENSOR_ORDER_N; i++) {
+    const SensorType t = SENSOR_ORDER[i];
+    if (!s_readThisWake[t]) continue;
+    if (raw[t] > 0.0f) {
+      s_failStreak[t] = 0;
+      if (!s_confirmed[t]) {
+        s_confirmed[t] = true;
+        Serial.printf("[Sensor] %s confirmed by a valid read\n", sensorTypeName(t));
+      }
+    } else if (s_confirmed[t] && ++s_failStreak[t] >= SENSOR_REDETECT_FAILS) {
+      Serial.printf("[Sensor] %s: %u empty bursts — re-detecting next wake\n",
+                    sensorTypeName(t), (unsigned)SENSOR_REDETECT_FAILS);
+      s_confirmed[t]  = false;
+      s_failStreak[t] = 0;
+      s_reprobeIn[t]  = 0;
+    }
+  }
+
+  // Primary = first VALID sensor in preference order: the radar feeds the
+  // level pipeline whenever it produced a burst; the ultrasonic takes over for
+  // a wake in which it didn't. Both per-sensor values travel with the reading.
+  float rawDist = -1.0f;
+  out.sensorType = SENSOR_TYPE_NONE;
+  g_burstSd = -1.0f; g_burstN = 0;
+  for (uint8_t i = 0; i < SENSOR_ORDER_N; i++) {
+    const SensorType t = SENSOR_ORDER[i];
+    if (raw[t] > 0.0f) {
+      out.sensorType = t; rawDist = raw[t]; g_burstSd = sd[t]; g_burstN = n[t];
+      break;
+    }
+  }
+  if (out.sensorType != SENSOR_TYPE_NONE && out.sensorType != s_activeType) {
+    Serial.printf("[Sensor] %s burst empty — %s is the primary for this wake\n",
+                  sensorTypeName(s_activeType), sensorTypeName(out.sensorType));
+  }
+  out.distanceRadarCm = raw[SENSOR_TYPE_LD2413];
+  out.distanceUsCm    = raw[SENSOR_TYPE_RCWL1670];
+  out.usBurstSd       = sd [SENSOR_TYPE_RCWL1670];
+  out.usBurstN        = n  [SENSOR_TYPE_RCWL1670];
+  if (out.distanceRadarCm > 0.0f && out.distanceUsCm > 0.0f) {
+    Serial.printf("[Sensor] radar %.1f cm  ultrasonic %.1f cm  (us-radar %+.1f cm)\n",
+                  out.distanceRadarCm, out.distanceUsCm,
+                  out.distanceUsCm - out.distanceRadarCm);
   }
 
   // Step 4 — Kalman filter (Q scaled by sleep duration set via sensorsSetSleepDuration)
@@ -1090,26 +1188,8 @@ SensorReadResult readAllSensors(SensorData& out) {
   out.distanceValid = (rawDist > 0.0f);
   result.distanceOk = out.distanceValid;
 
-  // Adaptive re-detection: a valid read confirms the sensor (promoting a
-  // fallback); SENSOR_REDETECT_FAILS consecutive invalid reads from a confirmed
-  // sensor force a fresh auto-detect next wake (sensor swapped / failed).
-  if (out.distanceValid) {
-    s_failStreak = 0;
-    if (!s_typeConfirmed) {
-      s_typeConfirmed = true;
-      Serial.printf("[Sensor] %s confirmed by a valid read\n",
-                    sensorTypeName(s_activeType));
-    }
-  } else if (s_typeConfirmed) {
-    if (++s_failStreak >= SENSOR_REDETECT_FAILS) {
-      Serial.println(F("[Sensor] Repeated read failures — re-detecting next wake"));
-      s_typeConfirmed = false;
-      s_failStreak    = 0;
-    }
-  }
-
-  // Burst QC + mode tag (filled by collapseBurst() during the read above) —
-  // travel with the reading so tide-reduction can judge each value's quality.
+  // Burst QC + mode tag (of the PRIMARY sensor's burst) — travel with the
+  // reading so tide-reduction can judge each value's quality.
   out.burstSd    = g_burstSd;
   out.burstN     = g_burstN;
   out.surveyMode = s_surveyMode;

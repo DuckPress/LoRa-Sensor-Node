@@ -104,6 +104,18 @@ static uint32_t msToRadioTicks(uint32_t ms) { return ms * 64UL; }
 //    n   — burst sample count                            [QC]
 //    sm  — survey-mode flag (0/1)                        [QC]
 //    mv  — mount-moved flag from optional tilt sensor (0/1) [QC]
+//    tl  — tilt from vertical (deg), -1 = no LIS2DW12      (node >= 1.2.9)
+//    pr  — station pressure (hPa), -1 = no barometer       (node >= 1.2.9)
+//    st  — which sensor fed d/dr/wl: 1 = RCWL-1670, 2 = LD2413, 0 = none
+//    du  — RCWL-1670 ultrasonic distance (cm, speed-of-sound corrected),
+//          -1 = absent/empty. With st, both sensors are recoverable: the
+//          radar's value is dr when st=2.                  (node >= 1.2.10)
+//
+//  Size budget: the SX1262 frame is 255 bytes. A typical payload is ~205
+//  bytes; with EVERY field at its widest (t=-999.00, seq=65535, tl=180.0,
+//  pr=1100.0, ...) it is 216, and the optional 32-char token adds 39 — i.e.
+//  the absolute worst case lands exactly on the limit. Keep any new field
+//  short-keyed and low-precision, and re-check this sum when adding one.
 // ================================================================
 static size_t buildPayload(char* buf, size_t bufSize,
                            const SensorData& data,
@@ -127,7 +139,9 @@ static size_t buildPayload(char* buf, size_t bufSize,
       "\"sm\":%d,"
       "\"mv\":%d,"
       "\"tl\":%.1f,"       // tilt from vertical (deg), -1 = no LIS2DW12
-      "\"pr\":%.1f",       // station pressure (hPa), -1 = no barometer
+      "\"pr\":%.1f,"       // station pressure (hPa), -1 = no barometer
+      "\"st\":%d,"         // primary sensor type (SensorType enum value)
+      "\"du\":%.1f",       // ultrasonic distance (cm), -1 = absent
                            // NOTE: object intentionally left open — see below
     data.isoTimestamp,
     data.distanceValid ? data.distanceCm   : -1.0f,
@@ -146,7 +160,9 @@ static size_t buildPayload(char* buf, size_t bufSize,
     data.surveyMode    ? 1 : 0,
     data.moved         ? 1 : 0,
     data.tiltDeg,
-    data.pressureHpa);
+    data.pressureHpa,
+    (int)data.sensorType,
+    data.distanceUsCm);
 
   if (n <= 0 || (size_t)n >= bufSize) {
     Serial.println(F("[LoRa] Payload truncated!"));

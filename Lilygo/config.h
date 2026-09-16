@@ -4,7 +4,7 @@
 // ================================================================
 //  Firmware Version
 // ================================================================
-#define FIRMWARE_VERSION "1.2.9"
+#define FIRMWARE_VERSION "1.2.10"
 
 // ================================================================
 //  Node Identity
@@ -15,28 +15,36 @@
 constexpr uint8_t NODE_ID = 1;
 
 // ================================================================
-//  Distance Sensors — multi-driver build with runtime AUTO-DETECT
+//  Distance Sensors — multi-driver build, every sensor read every wake
 //
-//  Enable EVERY driver you want available in the firmware (all three by
-//  default). At boot the node probes the enabled drivers and uses whichever
-//  sensor is actually connected — so you can swap sensors WITHOUT reflashing.
-//  The detected type is cached in RTC RAM across deep sleep and re-checked
-//  only on a cold boot or after SENSOR_REDETECT_FAILS consecutive failed
-//  reads, so a swapped/failed sensor is picked up within a few wakes without
-//  paying the probe cost on every wake.
+//  Enable EVERY driver you want available in the firmware (both by default).
+//  At boot the node detects each enabled sensor INDEPENDENTLY and, on every
+//  wake, reads ALL the ones present. The PRIMARY — the first present sensor
+//  in preference order, LD2413 radar then RCWL-1670 ultrasonic — feeds the
+//  Kalman/water-level pipeline; the other sensor's distance is carried on the
+//  same reading (SD log, LoRa `du`, cloud `dist_us_cm`) so the two can be
+//  cross-checked, and it takes over as primary for any wake in which the
+//  radar's burst comes back empty. Nothing is selected in code: wire one
+//  sensor or both and the node adapts.
 //
-//    ENABLE_SENSOR_RCWL1670  — RCWL-1670 ultrasonic (TRIG/ECHO)
+//  Detection state is cached in RTC RAM across deep sleep: a confirmed sensor
+//  is not re-probed each wake; SENSOR_REDETECT_FAILS consecutive empty bursts
+//  demote it (probed afresh next wake); a sensor that was NOT found is
+//  re-probed every SENSOR_ABSENT_REPROBE_WAKES wakes, so one plugged in later
+//  is picked up without paying the probe cost on every wake.
+//
+//    ENABLE_SENSOR_RCWL1670  — RCWL-1670 ultrasonic (TRIG/ECHO). Its raw range
+//                              gets the temperature/humidity speed-of-sound
+//                              correction; ~2.5 s of pings per wake.
 //    ENABLE_SENSOR_LD2413    — HLK-LD2413 24 GHz radar (UART). Immune to air
-//                              temperature/humidity, so the speed-of-sound
-//                              correction is skipped for it at runtime.
+//                              temperature/humidity, so no correction.
 //
 //  HARDWARE NOTE: the LD2413 uses the UART header pins (GPIO43/44) and the
 //  RCWL-1670 uses its own TRIG/ECHO pins (GPIO41/42), so the two are on
 //  independent pins — both can be wired at the same time with no conflict.
-//  Probe order is LD2413 (radar, preferred) → RCWL.
 // ================================================================
 #define ENABLE_SENSOR_LD2413
-//#define ENABLE_SENSOR_RCWL1670   // disabled — radar-only build (RCWL ultrasonic unused)
+#define ENABLE_SENSOR_RCWL1670
 
 #if !defined(ENABLE_SENSOR_RCWL1670) && !defined(ENABLE_SENSOR_LD2413)
   #error "config.h: enable at least one distance sensor (ENABLE_SENSOR_*)."
@@ -47,9 +55,16 @@ constexpr uint8_t NODE_ID = 1;
 // ENABLED sensor (SENSOR_TYPE_RCWL1670 / SENSOR_TYPE_LD2413).
 #define SENSOR_DETECT_FALLBACK  SENSOR_TYPE_LD2413
 
-// Consecutive invalid reads from the cached sensor that trigger a fresh
-// auto-detect next wake (covers a sensor that was swapped, unplugged or died).
+// Consecutive empty bursts from a confirmed sensor that demote it to
+// unconfirmed, so it is probed afresh next wake (covers a sensor that was
+// swapped, unplugged or died). Applied to each sensor independently.
 constexpr uint8_t SENSOR_REDETECT_FAILS = 3;
+
+// Wakes between probes of an enabled sensor that was NOT found (an RCWL probe
+// is ~0.4 s, an LD2413 probe ~2 s — not worth paying on every wake for a
+// sensor that isn't fitted). 20 wakes ≈ 20 min at the normal cadence, so a
+// sensor added later still shows up on its own within that.
+constexpr uint16_t SENSOR_ABSENT_REPROBE_WAKES = 20;
 
 // ================================================================
 //  Credentials — NOT compiled into the binary.
@@ -450,10 +465,18 @@ constexpr const char* LOG_FILENAME     = "/tidelog.csv";
 constexpr const char* LOG_ROLLED_FILENAME = "/tidelog_old.csv";
 // Boot/reset diagnostics — one line per non-deep-sleep reboot (brownout/panic).
 constexpr const char* BOOTLOG_FILENAME = "/bootlog.csv";
+// Columns after pressure_hpa (node >= 1.2.10, dual-sensor build):
+//   sensor          — which sensor fed dist_raw/dist_kalman/water_level this
+//                     wake (LD2413 / RCWL-1670 / NONE)
+//   dist_radar_cm   — LD2413 trimmed mean (-1 = absent / empty burst)
+//   dist_us_cm      — RCWL-1670 trimmed mean, speed-of-sound corrected (-1 = absent)
+//   us_burst_sd_cm, us_burst_n — the ultrasonic burst's own QC stats
+//   (burst_sd_cm / burst_n above are the PRIMARY sensor's)
 constexpr const char* LOG_HEADER   =
     "timestamp,rtc_valid,dist_raw_cm,dist_kalman_cm,water_level_cm,"
     "temp_c,humidity_pct,bat_v,wifi_rssi,wake_count,"
-    "burst_sd_cm,burst_n,survey_mode,mount_moved,tilt_deg,pressure_hpa\n";
+    "burst_sd_cm,burst_n,survey_mode,mount_moved,tilt_deg,pressure_hpa,"
+    "sensor,dist_radar_cm,dist_us_cm,us_burst_sd_cm,us_burst_n\n";
 
 // ================================================================
 //  Adaptive Deep Sleep

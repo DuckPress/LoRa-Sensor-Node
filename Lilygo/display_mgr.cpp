@@ -110,10 +110,18 @@ void displayData(const SensorData& data,
     oled.print(F("Dist: ---"));
   }
 
-  // Row 2 — water level
+  // Row 2 — water level, plus the second sensor's distance when both read
+  // (the primary's raw value is on row 1; "U:" is the ultrasonic, "Rd:" the
+  // radar, whichever did NOT feed the level this wake).
   oled.setCursor(0, ROW2_Y);
   if (data.distanceValid) {
-    oled.printf("WL: %.2f cm", data.waterLevelCm);
+    if (data.sensorType == SENSOR_TYPE_LD2413 && data.distanceUsCm > 0.0f) {
+      oled.printf("WL:%.1fcm U:%.1f", data.waterLevelCm, data.distanceUsCm);
+    } else if (data.sensorType == SENSOR_TYPE_RCWL1670 && data.distanceRadarCm > 0.0f) {
+      oled.printf("WL:%.1fcm Rd:%.1f", data.waterLevelCm, data.distanceRadarCm);
+    } else {
+      oled.printf("WL: %.2f cm", data.waterLevelCm);
+    }
   } else {
     oled.print(F("WL: ---"));
   }

@@ -332,13 +332,14 @@ void setup() {
   sensorsSetSleepDuration(s_lastSleepSecs);
   sensorsSetSurveyMode(s_surveyMode);   // long radar burst + QC tag when on
   sensorsSetMotionWake(motionWake);     // flags this reading moved=1 if INT1 woke us
-  sensorsInit();                        // auto-detects the connected sensor
+  sensorsInit();                        // detects every connected distance sensor
   esp_task_wdt_reset();
 
-  // Surface the auto-detected sensor (no-op on the OLED if the panel is off).
-  Serial.printf("[Sensor] Active distance sensor: %s\n",
-                sensorTypeName(sensorsActiveType()));
-  displaySplash("SENSOR " FIRMWARE_VERSION, sensorTypeName(sensorsActiveType()));
+  // Surface what was detected (no-op on the OLED if the panel is off). Every
+  // present sensor is read each wake; the primary feeds the level pipeline.
+  Serial.printf("[Sensor] Distance sensors: %s  (primary %s)\n",
+                sensorsPresentName(), sensorTypeName(sensorsActiveType()));
+  displaySplash("SENSOR " FIRMWARE_VERSION, sensorsPresentName());
 
   // ---- SD ----
   crashStageSet(STAGE_SD_INIT);
@@ -436,11 +437,15 @@ void setup() {
   Serial.printf("[DATA] ts=%s  rtc=%s\n",
                 data.isoTimestamp, data.rtcValid ? "OK" : "EST");
   if (result.distanceOk) {
-    Serial.printf("       dist_raw=%.1f cm  dist_k=%.1f cm  water=%.1f cm\n",
-                  data.distanceRaw, data.distanceCm, data.waterLevelCm);
+    Serial.printf("       dist_raw=%.1f cm  dist_k=%.1f cm  water=%.1f cm  [%s]\n",
+                  data.distanceRaw, data.distanceCm, data.waterLevelCm,
+                  sensorTypeName(data.sensorType));
   } else {
     Serial.println(F("       dist=FAIL"));
   }
+  Serial.printf("       radar=%.1f cm  ultrasonic=%.1f cm (sd %.2f, n %u)\n",
+                data.distanceRadarCm, data.distanceUsCm,
+                data.usBurstSd, (unsigned)data.usBurstN);
   if (result.envOk) {
     Serial.printf("       T=%.2f C  RH=%.1f%%  bat=%.2fV\n",
                   data.tempC, data.humidity, data.batV);

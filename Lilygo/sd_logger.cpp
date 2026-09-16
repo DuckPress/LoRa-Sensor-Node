@@ -95,13 +95,14 @@ bool sdLog(const SensorData& data, uint32_t wakeCount, int32_t wifiRssi) {
   // CSV columns match LOG_HEADER in config.h:
   // timestamp, rtc_valid, dist_raw_cm, dist_kalman_cm, water_level_cm,
   // temp_c, humidity_pct, bat_v, wifi_rssi, wake_count,
-  // burst_sd_cm, burst_n, survey_mode, mount_moved, tilt_deg, pressure_hpa
+  // burst_sd_cm, burst_n, survey_mode, mount_moved, tilt_deg, pressure_hpa,
+  // sensor, dist_radar_cm, dist_us_cm, us_burst_sd_cm, us_burst_n
   //
   // Format the row first so a SHORT write (card full mid-row) is detected —
   // comparing only against 0 would call a truncated row a success.
   char row[256];
   int len = snprintf(row, sizeof(row),
-    "%s,%d,%.2f,%.2f,%.2f,%.2f,%.1f,%.2f,%ld,%lu,%.2f,%u,%d,%d,%.1f,%.1f\n",
+    "%s,%d,%.2f,%.2f,%.2f,%.2f,%.1f,%.2f,%ld,%lu,%.2f,%u,%d,%d,%.1f,%.1f,%s,%.2f,%.2f,%.2f,%u\n",
     data.isoTimestamp,
     data.rtcValid      ? 1    : 0,
     data.distanceValid ? data.distanceRaw  : -1.0f,
@@ -117,7 +118,12 @@ bool sdLog(const SensorData& data, uint32_t wakeCount, int32_t wifiRssi) {
     data.surveyMode    ? 1 : 0,
     data.moved         ? 1 : 0,
     data.tiltDeg,                     // -1 = no tilt sensor
-    data.pressureHpa);                // -1 = no barometer
+    data.pressureHpa,                 // -1 = no barometer
+    sensorTypeName(data.sensorType),  // which sensor fed the columns above
+    data.distanceRadarCm,             // per-sensor trimmed means, -1 = absent
+    data.distanceUsCm,
+    data.usBurstSd,                   // ultrasonic burst QC (-1 = unknown)
+    (unsigned)data.usBurstN);
   if (len <= 0 || (size_t)len >= sizeof(row)) {
     f.close();
     Serial.println(F("[SD] Row format failed"));

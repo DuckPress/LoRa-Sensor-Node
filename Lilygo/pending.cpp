@@ -28,11 +28,12 @@ static bool pendingLineToQuery(const String& line, String& queryOut) {
   float dist   = -1.0f, distRaw = -1.0f, wl  = -1.0f;
   float temp   = -999.0f, hum   = -1.0f, bat = -1.0f;
   float sd     = -1.0f, tl = -1.0f, pr = -1.0f;   // tl/pr absent on pre-1.2.9 lines
-  int   bn     = 0, sm = 0, mv = 0;
+  float du     = -1.0f;                            // st/du absent on pre-1.2.10 lines
+  int   bn     = 0, sm = 0, mv = 0, st = 0;
 
-  int parsed = sscanf(line.c_str(), "%23[^,],%f,%f,%f,%f,%f,%f,%f,%d,%d,%d,%f,%f",
+  int parsed = sscanf(line.c_str(), "%23[^,],%f,%f,%f,%f,%f,%f,%f,%d,%d,%d,%f,%f,%d,%f",
                       ts, &dist, &distRaw, &wl, &temp, &hum, &bat,
-                      &sd, &bn, &sm, &mv, &tl, &pr);
+                      &sd, &bn, &sm, &mv, &tl, &pr, &st, &du);
   if (parsed < 7 || ts[0] == '\0') return false;
 
   char q[512];
@@ -51,9 +52,11 @@ static bool pendingLineToQuery(const String& line, String& queryOut) {
     "&sm=%d"
     "&mv=%d"
     "&tl=%.1f"
-    "&pr=%.1f",
+    "&pr=%.1f"
+    "&st=%d"
+    "&du=%.2f",
     ts, dist, distRaw, wl, temp, hum, bat,
-    (unsigned)NODE_ID, sd, bn, sm, mv, tl, pr);
+    (unsigned)NODE_ID, sd, bn, sm, mv, tl, pr, st, du);
   if (n <= 0 || (size_t)n >= sizeof(q)) return false;
 
   queryOut = q;
@@ -101,7 +104,7 @@ void pendingAppend(const SensorData& data) {
   // PENDING_MAX_RETRIES) — dropped entries are counted this way instead of
   // being kept forever.
   f.print("0|");
-  f.printf("%s,%.2f,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f,%u,%d,%d,%.1f,%.1f\n",
+  f.printf("%s,%.2f,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f,%u,%d,%d,%.1f,%.1f,%d,%.2f\n",
     data.isoTimestamp,
     data.distanceValid ? data.distanceCm   : -1.0f,
     data.distanceValid ? data.distanceRaw  : -1.0f,
@@ -115,7 +118,9 @@ void pendingAppend(const SensorData& data) {
     data.surveyMode    ? 1 : 0,
     data.moved         ? 1 : 0,
     data.tiltDeg,
-    data.pressureHpa);
+    data.pressureHpa,
+    (int)data.sensorType,     // node >= 1.2.10: primary sensor + ultrasonic
+    data.distanceUsCm);       //   distance ride at the end (older lines lack them)
   f.close();
 }
 
@@ -407,11 +412,12 @@ static bool pendingLineToSensorData(const String& line, SensorData& d) {
   float dist   = -1.0f, distRaw = -1.0f, wl  = -1.0f;
   float temp   = -999.0f, hum   = -1.0f, bat = -1.0f;
   float sd     = -1.0f, tl = -1.0f, pr = -1.0f;   // tl/pr absent on pre-1.2.9 lines
-  int   bn     = 0, sm = 0, mv = 0;
+  float du     = -1.0f;                            // st/du absent on pre-1.2.10 lines
+  int   bn     = 0, sm = 0, mv = 0, st = 0;
 
-  int parsed = sscanf(line.c_str(), "%23[^,],%f,%f,%f,%f,%f,%f,%f,%d,%d,%d,%f,%f",
+  int parsed = sscanf(line.c_str(), "%23[^,],%f,%f,%f,%f,%f,%f,%f,%d,%d,%d,%f,%f,%d,%f",
                       ts, &dist, &distRaw, &wl, &temp, &hum, &bat,
-                      &sd, &bn, &sm, &mv, &tl, &pr);
+                      &sd, &bn, &sm, &mv, &tl, &pr, &st, &du);
   if (parsed < 7 || ts[0] == '\0') return false;
 
   d = SensorData();   // start from defaults
@@ -431,6 +437,11 @@ static bool pendingLineToSensorData(const String& line, SensorData& d) {
   d.moved         = (mv != 0);
   d.tiltDeg       = tl;
   d.pressureHpa   = pr;
+  // Dual-sensor fields (node >= 1.2.10). Older lines leave st=0/du=-1; the
+  // radar value is recoverable from distRaw when st says the radar was primary.
+  d.sensorType    = (st > 0 && st < SENSOR_TYPE_COUNT) ? (SensorType)st : SENSOR_TYPE_NONE;
+  d.distanceUsCm  = du;
+  d.distanceRadarCm = (d.sensorType == SENSOR_TYPE_LD2413) ? distRaw : -1.0f;
   d.rtcValid      = true;                 // the queued ts is a real logged time
   return true;
 }
