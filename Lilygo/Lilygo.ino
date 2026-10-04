@@ -1,9 +1,11 @@
 /*
- * Lilygo T3-S3 v1.2 — Sensor Node Firmware  v1.2.0
+ * Lilygo T3-S3 v1.2 — Sensor Node Firmware  (version: FIRMWARE_VERSION, config.h)
  *
- * Sensors  : HLK-LD2413 24 GHz radar (UART: ESP RX=GPIO44, TX=GPIO43)
+ * Sensors  : HLK-LD2413 24 GHz radar (UART: ESP RX=GPIO44, TX=GPIO43)  [primary]
+ *            RCWL-1670 ultrasonic    (TRIG=GPIO41, ECHO=GPIO42)        [cross-check]
  *            SHT3x temp/humidity (I2C Wire1, SDA=GPIO16, SCL=GPIO15)
  *            DS3231 RTC          (I2C Wire1, shared bus)
+ *            optional LIS2DW12 tilt + BMP/BME280 pressure (Wire1, auto-detected)
  *
  * Storage  : Onboard MicroSD (SPI FSPI, default bus)
  * Display  : Onboard SSD1306 128×64 OLED (I2C Wire, SDA=18, SCL=17)
@@ -12,13 +14,16 @@
  *            (2) WiFi → Google Apps Script HTTPS                      [SECONDARY]
  *            (3) OTA via GitHub Releases                              [MAINTENANCE]
  *
- * Power    : Deep sleep between readings — 10–120 s adaptive.
- *            WiFi connects only every WIFI_UPLOAD_EVERY_N wakes.
- *            LiPo < BAT_CUTOFF_V skips radio TX entirely.
+ * Power    : Deep sleep between readings — SLEEP_DURATION_US cadence
+ *            (SURVEY_SLEEP_US in survey mode). WiFi only every
+ *            WIFI_UPLOAD_EVERY_N wakes, backing off to WIFI_BACKOFF_EVERY_N
+ *            while no network answers; LoRa retries back off while the
+ *            gateway is silent. LiPo < BAT_CUTOFF_V skips radio TX entirely.
  *
- * Distance : 30 ultrasonic pulses → trim 8+8 → mean
- *            → temperature-corrected speed-of-sound
- *            → 1-D Kalman filter (Q scaled by actual sleep duration)
+ * Distance : every sensor present is read each wake: burst → trimmed mean
+ *            (the ultrasonic also speed-of-sound corrected) → that sensor's
+ *            own 1-D Kalman filter (Q scaled by the real sleep). The radar is
+ *            the primary; the ultrasonic stands in when a radar burst is empty.
  *
  * PARTITION SCHEME (required for OTA):
  *   Tools → Partition Scheme → Minimal SPIFFS (1.9MB APP/190KB SPIFFS)
@@ -45,6 +50,7 @@
 #include <esp_task_wdt.h>
 #include <esp_system.h>   // esp_reset_reason()
 #include <Preferences.h>  // NVS boot-loop counter (survives brownout/panic)
+#include <sys/time.h>     // gettimeofday() — measures an early (motion) wake
 
 // ================================================================
 //  RTC RAM — persists across deep sleep
@@ -88,6 +94,34 @@ static uint32_t s_wakeStartedMs = 0;
 // spans deep-sleep wakes; a reset (which zeroes it) is itself a fresh start.
 RTC_DATA_ATTR static uint32_t s_consecutiveNoAck = 0;
 
+// Consecutive WiFi wakes whose connect failed. Past WIFI_FAIL_BACKOFF_AFTER the
+// node only tries WiFi every WIFI_BACKOFF_EVERY_N wakes (see config.h); one
+// success, or any reset, restores the normal interval.
+RTC_DATA_ATTR static uint8_t  s_wifiFailStreak = 0;
+
+// Wake count of the last Config-requested OTA check (0 = none since reset), so
+// a standing ota_update_requested=1 costs one GitHub check per
+// OTA_REQUEST_MIN_WAKES instead of one on every WiFi wake.
+RTC_DATA_ATTR static uint32_t s_lastOtaReqWake = 0;
+
+// Set once this node has applied a remote tilt-baseline reset; the next nodecfg
+// poll then carries &trd=1 and the cloud clears the one-shot only on that
+// confirmation (a lost response can't swallow the reset).
+RTC_DATA_ATTR static bool     s_tiltResetAck   = false;
+
+// Motion-wake rate limit: after a motion (EXT0) wake the accelerometer interrupt
+// stays disarmed for MOTION_WAKE_HOLDOFF_WAKES wakes.
+RTC_DATA_ATTR static uint8_t  s_motionHoldoff  = 0;
+
+// System time (µs, gettimeofday) right before the last deep sleep. The RTC timer
+// keeps system time running through deep sleep, so after an EARLY (motion) wake
+// the real sleep length is now − this, not the programmed duration.
+RTC_DATA_ATTR static int64_t  s_sleepEnterUs   = 0;
+
+// Which sensor produced s_prevDistanceCm (the adaptive-sleep delta only compares
+// a sensor with itself).
+RTC_DATA_ATTR static uint8_t  s_prevSensor     = 0;
+
 // Set from the NVS boot-loop counter at the top of setup(): true means the node
 // has rebooted without completing a wake too many times in a row and should run
 // this wake in SAFE MODE (no radio, SD-log only, long recovery sleep).
@@ -96,9 +130,23 @@ static bool s_safeMode = false;
 // Remote recovery knobs fetched from the Config sheet (?action=nodecfg) on WiFi
 // wakes. pause_flush halts backlog draining; flush_cap (0 = auto/voltage-scaled)
 // hard-limits entries per wake. Let an operator throttle a struggling field
-// node from the sheet without a reflash or a site visit.
-static bool     s_pauseFlush = false;
-static uint32_t s_flushCap   = 0;
+// node from the sheet without a reflash or a site visit. RTC RAM: they must
+// still hold on the non-WiFi wakes, which is where the LoRa backlog flush runs.
+RTC_DATA_ATTR static bool     s_pauseFlush = false;
+RTC_DATA_ATTR static uint32_t s_flushCap   = 0;
+
+// Current system time in µs (see s_sleepEnterUs).
+static int64_t nowUs() {
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  return (int64_t)tv.tv_sec * 1000000LL + (int64_t)tv.tv_usec;
+}
+
+// OTA downloads ~1.3 MB over WiFi — only with a healthy resting cell (or none:
+// an implausible reading is USB-only operation).
+static bool otaBatteryOk(float v) {
+  return v <= BAT_PLAUSIBLE_MIN_V || v > BAT_PLAUSIBLE_MAX_V || v >= OTA_MIN_BAT_V;
+}
 
 // ================================================================
 //  Graceful shutdown helpers — called before every deep sleep
@@ -188,10 +236,14 @@ static void enterDeepSleep(uint64_t sleepUs) {
   Serial.flush();
   crashStageSet(STAGE_SLEEP);
   // Arm the accelerometer's wake-up interrupt BEFORE the I2C bus is released
-  // (no-op when no LIS2DW12 / PIN_TILT_INT is fitted). The timer wake below
-  // stays armed too — whichever fires first wakes the node.
-  tiltArmMotionWake();
+  // (no-op when no LIS2DW12 / PIN_TILT_INT is fitted) — unless a recent motion
+  // wake put it on hold-off, so a vibrating mount can't keep re-waking the
+  // node. The timer wake below stays armed either way; whichever fires first
+  // wakes the node.
+  if (s_motionHoldoff > 0) s_motionHoldoff--;
+  else                     tiltArmMotionWake();
   shutdownPeripherals();
+  s_sleepEnterUs = nowUs();
   esp_deep_sleep(sleepUs);
 }
 
@@ -248,10 +300,23 @@ static void checkDebugButton() {
 // ================================================================
 void setup() {
   s_wakeStartedMs = millis();
-  // Accumulate elapsed time at the very top so the epoch estimate is
-  // updated even on an early-exit wake (e.g. battery cutoff).
   s_wakeCount++;
-  s_elapsedEstSecs += s_lastSleepSecs;
+
+  // How long did we actually sleep? The programmed duration — unless the
+  // accelerometer's INT1 line woke us early (motion wake); then measure it from
+  // the system time, which the RTC timer keeps running through deep sleep.
+  // Accumulated at the very top so the epoch estimate is updated even on an
+  // early-exit wake (e.g. battery cutoff).
+  const bool motionWake = (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0);
+  uint32_t sleptSecs = s_lastSleepSecs;
+  if (motionWake && s_sleepEnterUs > 0) {
+    const int64_t d = nowUs() - s_sleepEnterUs;
+    if (d > 0 && d < (int64_t)s_lastSleepSecs * 1000000LL) {
+      sleptSecs = (uint32_t)((d + 500000LL) / 1000000LL);
+    }
+  }
+  s_elapsedEstSecs += sleptSecs;
+  if (motionWake) s_motionHoldoff = MOTION_WAKE_HOLDOFF_WAKES;
 
   Serial.begin(115200);
   delay(200);
@@ -268,8 +333,11 @@ void setup() {
   // crumb for this run. Used in the bootlog line and the crash summary.
   uint8_t prevStage = crashBootBegin(resetReason);
   // Motion wake: the LIS2DW12 INT1 line pulled the node out of deep sleep.
-  bool motionWake = (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0);
-  if (motionWake) Serial.println(F("[Boot] Woken by tilt/motion interrupt"));
+  if (motionWake) {
+    Serial.printf("[Boot] Woken by tilt/motion interrupt after %lu s — motion wake "
+                  "disarmed for %u wakes\n", (unsigned long)sleptSecs,
+                  (unsigned)MOTION_WAKE_HOLDOFF_WAKES);
+  }
 
   // ---- Boot-loop detection ----
   // Count this reboot in NVS (survives the brownout/panic that wipes RTC RAM)
@@ -297,8 +365,12 @@ void setup() {
   // WiFi/OTA wake someone may be looking at). Frequent LoRa-only wakes are
   // unwatched, so we leave the OLED powered down to save its ~7–8 mA. These
   // same flags gate the WiFi/OTA work further down.
-  bool isWifiWake = (s_wakeCount == 1) ||
-                    (s_wakeCount % WIFI_UPLOAD_EVERY_N == 0);
+  // While WiFi keeps failing (no reachable network) stretch the interval to
+  // WIFI_BACKOFF_EVERY_N — a failed attempt costs ~12 s of radio per SSID.
+  // Wake #1 after any reset always tries (the streak lives in RTC RAM).
+  const uint32_t wifiEvery = (s_wifiFailStreak >= WIFI_FAIL_BACKOFF_AFTER)
+                             ? WIFI_BACKOFF_EVERY_N : WIFI_UPLOAD_EVERY_N;
+  bool isWifiWake = (s_wakeCount == 1) || (s_wakeCount % wifiEvery == 0);
   // Deliberately NOT triggered on wake #1. A cold boot already runs the
   // highest-current work in the whole schedule (WiFi TX + radio), and stacking
   // an OTA check (another sustained network+flash burst) on top of it is what
@@ -306,8 +378,8 @@ void setup() {
   // RAM, the wake counter resets to 1 and the node re-enters this exact
   // high-current path forever — a self-perpetuating reset loop that never
   // reaches a low-current normal wake. OTA still runs on its periodic schedule
-  // and on demand via the Config sheet (see otaRequested below); it just no
-  // longer piles onto every cold boot.
+  // and on demand via the Config sheet (see otaReqDue below — also never on
+  // wake #1); it just no longer piles onto every cold boot.
   bool isOtaWake  = (s_wakeCount != 1) &&
                     (s_wakeCount % OTA_CHECK_EVERY_N   == 0);
   bool useDisplay = DISPLAY_ENABLED && (isWifiWake || isOtaWake);
@@ -329,7 +401,7 @@ void setup() {
   // Notify the Kalman filter about the actual previous sleep duration so
   // it can scale process noise Q correctly before the first readAllSensors().
   crashStageSet(STAGE_SENSORS_INIT);
-  sensorsSetSleepDuration(s_lastSleepSecs);
+  sensorsSetSleepDuration(sleptSecs);
   sensorsSetSurveyMode(s_surveyMode);   // long radar burst + QC tag when on
   sensorsSetMotionWake(motionWake);     // flags this reading moved=1 if INT1 woke us
   sensorsInit();                        // detects every connected distance sensor
@@ -412,24 +484,19 @@ void setup() {
     }
   }
 
-  // ---- Clock-staleness guard (C2) ----
-  // The RTC runs at the right rate but can hold a wrong OFFSET if it hasn't been
-  // NTP-corrected in a long time (LoRa-only node, or a dead RTC backup cell). If
-  // the gap since the last successful NTP sync exceeds MAX_RTC_UNSYNCED_SEC,
-  // stop trusting the absolute time: flag rtc_valid=0 so the cloud uses the
-  // gateway's clock (gw_ts) instead of a drifted node_ts. The rate is fine, so
-  // (now - lastSync) is an honest elapsed time even when the offset is wrong.
+  // ---- Clock-trust guard (C2) ----
+  // A readable RTC isn't necessarily a RIGHT one. Stop trusting its absolute
+  // time — flag rtc_valid=0 so the cloud uses the gateway's clock (gw_ts)
+  // instead of a wrong node_ts — when it was re-seeded from the firmware build
+  // time after losing power and hasn't been synced since, when it reads
+  // earlier than the last successful sync (it was reset), or when it hasn't
+  // been NTP/gateway-corrected for longer than MAX_RTC_UNSYNCED_SEC (a
+  // LoRa-only node with a drifting offset). See rtcTimeTrusted().
   if (data.rtcValid) {
-    Preferences clkPrefs;
-    clkPrefs.begin("clk", true);                 // read-only
-    uint32_t lastSync = clkPrefs.getUInt("lastsync", 0);
-    clkPrefs.end();
-    if (lastSync != 0 && data.epochSeconds > lastSync &&
-        (data.epochSeconds - lastSync) > MAX_RTC_UNSYNCED_SEC) {
-      Serial.printf("[RTC] Unsynced for ~%lu h (> %lu h) — flagging rtc_valid=0; "
-                    "cloud will use gw_ts\n",
-                    (unsigned long)((data.epochSeconds - lastSync) / 3600UL),
-                    (unsigned long)(MAX_RTC_UNSYNCED_SEC / 3600UL));
+    const char* why = nullptr;
+    if (!rtcTimeTrusted(data.epochSeconds, &why)) {
+      Serial.printf("[RTC] Clock not trusted (%s) — flagging rtc_valid=0; "
+                    "cloud will use gw_ts\n", why ? why : "?");
       data.rtcValid = false;
     }
   }
@@ -485,6 +552,10 @@ void setup() {
   // ================================================================
   if (data.batValid && data.batV < BAT_CUTOFF_V) {
     Serial.printf("[WARN] Low battery %.2fV — skipping TX, long recovery sleep\n", data.batV);
+    // No radio this wake — queue the reading so it still reaches the cloud once
+    // the cell recovers (a cheap SD append; tidelog.csv already holds it).
+    pendingAppend(data);
+    s_backlogPending = true;
     char batMsg[16];
     snprintf(batMsg, sizeof(batMsg), "%.2fV LOW", data.batV);
     displaySplash("LOW BATTERY", batMsg);
@@ -509,7 +580,8 @@ void setup() {
   // faster whenever the surface actually moves so the spike-rejecting filter
   // can confirm or reject it quickly — rather than reacting to the filter's
   // own smoothing transient (which previously caused phantom "fast change").
-  else if (data.distanceValid && s_prevDistanceCm > 0.0f) {
+  else if (data.distanceValid && s_prevDistanceCm > 0.0f &&
+           (uint8_t)data.sensorType == s_prevSensor) {   // compare a sensor with itself
     float delta = fabsf(data.distanceRaw - s_prevDistanceCm);
     if (delta > ADAPTIVE_DELTA_FAST_CM) {
       sleepDurationUs = SLEEP_MIN_US;
@@ -521,7 +593,10 @@ void setup() {
                     delta, sleepDurationUs / 1000000ULL);
     }
   }
-  if (data.distanceValid) s_prevDistanceCm = data.distanceRaw;
+  if (data.distanceValid) {
+    s_prevDistanceCm = data.distanceRaw;
+    s_prevSensor     = (uint8_t)data.sensorType;
+  }
 
   // ================================================================
   //  LoRa transmit (primary path — every wake)
@@ -553,7 +628,15 @@ void setup() {
       Serial.println(F("[LoRa] Distance invalid — TX anyway as a flagged reading"));
     crashStageSet(STAGE_LORA_TX);
     esp_task_wdt_reset();
-    LoRaSendResult res = loraSend(data, s_lastWifiRssi);
+    // While the gateway has been silent for a while, one attempt per wake is
+    // enough to notice it coming back; full retries resume with the next ACK.
+    const uint8_t attempts = (s_consecutiveNoAck >= LORA_NOACK_BACKOFF_AFTER)
+                             ? LORA_BACKOFF_ATTEMPTS : LORA_MAX_RETRIES;
+    if (attempts < LORA_MAX_RETRIES) {
+      Serial.printf("[LoRa] Gateway silent for %lu wakes — %u attempt(s) this wake\n",
+                    (unsigned long)s_consecutiveNoAck, (unsigned)attempts);
+    }
+    LoRaSendResult res = loraSend(data, s_lastWifiRssi, attempts);
     esp_task_wdt_reset();
     switch (res) {
       case LoRaSendResult::OK:     loraStatus = 1; break;
@@ -580,10 +663,7 @@ void setup() {
       uint32_t gwEpoch = loraLastGatewayEpoch();
       if (gwEpoch > NTP_MIN_VALID_EPOCH) {
         rtcSyncIfDrifted(gwEpoch, RTC_NTP_MAX_SKEW_SEC);
-        Preferences clkPrefs;
-        clkPrefs.begin("clk", false);
-        clkPrefs.putUInt("lastsync", gwEpoch);
-        clkPrefs.end();
+        rtcMarkSynced(gwEpoch);
         Serial.printf("[RTC] Synced from gateway ACK (epoch %lu)\n",
                       (unsigned long)gwEpoch);
       }
@@ -601,6 +681,11 @@ void setup() {
   // True once a WiFi wake has (connected and) run the WiFi backlog flush this
   // wake — so the LoRa backlog flush below doesn't also drain the same queue.
   bool   wifiFlushed = false;
+  // True once THIS reading is safe beyond the SD log: ACKed by the gateway or
+  // uploaded directly. Anything still unsecured after the WiFi block is queued
+  // in one place below — so no path (OTA-only wake, WiFi failure, safe mode)
+  // can leave a reading out of the backlog. (C1) Flagged readings included.
+  bool   readingSecured = (loraStatus == 1);
 
   if (s_safeMode) {
     Serial.println(F("[SafeMode] Skipping WiFi/OTA/flush (radio off for recovery)"));
@@ -612,6 +697,7 @@ void setup() {
     esp_task_wdt_reset();
 
     if (wifiOk) {
+      s_wifiFailStreak = 0;
       s_lastWifiRssi = wifiRSSI();
 
       // ---- NTP → DS3231 resync ----
@@ -634,12 +720,10 @@ void setup() {
       if (nowUtc >= (time_t)NTP_MIN_VALID_EPOCH) {
         uint32_t localEpoch = (uint32_t)nowUtc + RTC_TZ_OFFSET_SEC;
         rtcSyncIfDrifted(localEpoch, RTC_NTP_MAX_SKEW_SEC);
-        // Record the sync time (C2): lets the staleness guard above tell "clock
-        // verified recently" from "drifting for days" on later LoRa-only wakes.
-        Preferences clkPrefs;
-        clkPrefs.begin("clk", false);
-        clkPrefs.putUInt("lastsync", localEpoch);
-        clkPrefs.end();
+        // Record the sync (C2): lets the trust guard above tell "clock verified
+        // recently" from "drifting for days" on later LoRa-only wakes, and
+        // clears a post-power-loss "unverified" flag.
+        rtcMarkSynced(localEpoch);
       } else {
         Serial.println(F("[RTC] NTP not ready — RTC not resynced this wake"));
       }
@@ -654,11 +738,14 @@ void setup() {
         // Report the running firmware version (fw=) so the cloud can confirm an
         // OTA landed — the node→GAS nodecfg poll happens every WiFi wake and needs
         // no gateway involvement, so version visibility doesn't depend on LoRa.
-        char cfgQ[64];
-        snprintf(cfgQ, sizeof(cfgQ), "action=nodecfg&id=%u&fw=%s",
-                 (unsigned)NODE_ID, FIRMWARE_VERSION);
+        // &trd=1 confirms a tilt-baseline reset applied on an earlier wake, so
+        // the cloud can clear that one-shot (it keeps offering it until then).
+        char cfgQ[80];
+        snprintf(cfgQ, sizeof(cfgQ), "action=nodecfg&id=%u&fw=%s%s",
+                 (unsigned)NODE_ID, FIRMWARE_VERSION, s_tiltResetAck ? "&trd=1" : "");
         String cfgBody;
         if (gasFetch(cfgQ, cfgBody)) {
+          s_tiltResetAck = false;   // any pending confirmation has now been delivered
           bool sm = (cfgBody.indexOf("\"sm\":1") >= 0);
           otaRequested = (cfgBody.indexOf("\"ota\":1") >= 0);
           if (sm != s_surveyMode) {
@@ -676,8 +763,13 @@ void setup() {
           if (s_flushCap)   Serial.printf("[Config] flush_cap = %lu this wake\n",
                                           (unsigned long)s_flushCap);
           // One-shot: the operator re-levelled the gauge — forget the tilt
-          // baseline so the next read captures the new installed orientation.
-          if (cfgBody.indexOf("\"tr\":1") >= 0) tiltResetBaseline();
+          // baseline so the next read captures the new installed orientation,
+          // and confirm it on the next poll (the cloud clears the flag then;
+          // a repeat before that just re-captures the baseline).
+          if (cfgBody.indexOf("\"tr\":1") >= 0) {
+            tiltResetBaseline();
+            s_tiltResetAck = true;
+          }
         }
         esp_task_wdt_reset();
       }
@@ -689,16 +781,26 @@ void setup() {
       crashUploadIfAny(data.isoTimestamp);
       esp_task_wdt_reset();
 
-      // A remote OTA request is serviced on this WiFi wake rather than waiting
-      // for the periodic OTA schedule. A sleeping node cannot be woken over
-      // the internet, so the response is bounded by the WiFi wake period.
-      if (isOtaWake || otaRequested) {
-        crashStageSet(STAGE_OTA);
-        displaySplash("SENSOR " FIRMWARE_VERSION, "OTA check...");
-        otaInit();
-        esp_task_wdt_reset();
-        checkForOTAUpdate();
-        esp_task_wdt_reset();
+      // OTA: the periodic schedule, or a Config request. A request is honoured
+      // at most once per OTA_REQUEST_MIN_WAKES and never on wake #1 (see the
+      // wake-classification note above) — a standing ota_update_requested=1
+      // is then one GitHub check an hour, not one every WiFi wake. Either way
+      // only with a healthy battery: a brownout mid-download wastes it.
+      const bool otaReqDue = otaRequested && s_wakeCount != 1 &&
+          (s_lastOtaReqWake == 0 || s_wakeCount - s_lastOtaReqWake >= OTA_REQUEST_MIN_WAKES);
+      if (isOtaWake || otaReqDue) {
+        if (!otaBatteryOk(earlyBatV)) {
+          Serial.printf("[OTA] Battery %.2fV < %.2fV — update check deferred\n",
+                        earlyBatV, OTA_MIN_BAT_V);
+        } else {
+          if (otaReqDue) s_lastOtaReqWake = s_wakeCount;
+          crashStageSet(STAGE_OTA);
+          displaySplash("SENSOR " FIRMWARE_VERSION, "OTA check...");
+          otaInit();
+          esp_task_wdt_reset();
+          checkForOTAUpdate();
+          esp_task_wdt_reset();
+        }
       }
 
       if (isWifiWake) {
@@ -728,19 +830,16 @@ void setup() {
         // Only upload the CURRENT reading directly if LoRa didn't already
         // confirm delivery — otherwise the gateway is already forwarding it
         // and a direct upload would just double-hit GAS.
-        if (loraStatus != 1) {   // (C1) back up even a distance-flagged reading
+        if (!readingSecured) {   // (C1) back up even a distance-flagged reading
           crashStageSet(STAGE_UPLOAD);
           if (backlogAtStart || s_backlogPending) {
-            pendingAppend(data);
-            s_backlogPending = true;
+            // Queued below, behind the older backlog (keeps WiFi-path order).
             Serial.println(F("[Pending] Current reading held behind backlog"));
           } else if (uploadData(data, s_lastWifiRssi)) {
-            wifiStatus = 1;
+            wifiStatus     = 1;
+            readingSecured = true;
           } else {
-            // Direct upload failed too — queue for retry on the next wake.
-            wifiStatus = 0;
-            pendingAppend(data);
-            s_backlogPending = true;
+            wifiStatus = 0;      // direct upload failed — queued below
           }
           esp_task_wdt_reset();
         }
@@ -751,23 +850,23 @@ void setup() {
 
     } else {
       Serial.println(F("[WiFi] Could not connect"));
-      // Back up the current reading only if LoRa delivery wasn't confirmed.
-      if (isWifiWake && loraStatus != 1) {   // (C1) queue even a flagged reading
-        wifiStatus = 0;
-        pendingAppend(data);
-        s_backlogPending = true;
+      if (s_wifiFailStreak < 255) s_wifiFailStreak++;
+      if (s_wifiFailStreak == WIFI_FAIL_BACKOFF_AFTER) {
+        Serial.printf("[WiFi] %u failed WiFi wakes in a row — trying only every %lu wakes "
+                      "until one succeeds\n", (unsigned)s_wifiFailStreak,
+                      (unsigned long)WIFI_BACKOFF_EVERY_N);
       }
+      if (isWifiWake && !readingSecured) wifiStatus = 0;
     }
+  }
 
-  } else {
-    // Non-WiFi wake: buffer for the WiFi backup path ONLY if LoRa didn't
-    // confirm delivery. A LoRa-ACKed reading is already reaching the cloud
-    // via the gateway, so buffering it would double-upload and needlessly
-    // grow the queue. tidelog.csv on SD remains the complete record.
-    if (loraStatus != 1) {   // (C1) queue even a distance-flagged reading
-      pendingAppend(data);
-      s_backlogPending = true;
-    }
+  // Anything the gateway didn't ACK and that wasn't uploaded directly waits in
+  // the SD queue for the next flush (WiFi or LoRa). A LoRa-ACKed reading is not
+  // queued — the gateway is already forwarding it, and queueing it would
+  // double-upload and needlessly grow the queue. tidelog.csv holds it anyway.
+  if (!readingSecured) {   // (C1) including a distance-flagged reading
+    pendingAppend(data);
+    s_backlogPending = true;
   }
 
   // ================================================================
@@ -778,13 +877,14 @@ void setup() {
   //  gateway, so a node with no WiFi still recovers its backlog. Runs only after
   //  the real-time reading was ACKed (loraStatus==1 => the link is proven up),
   //  respects the remote pause_flush knob, and is bounded/battery-gated inside
-  //  loraFlushPending(). earlyBatV is the pre-radio resting voltage.
+  //  loraFlushPending() (remote flush_cap included). earlyBatV is the
+  //  pre-radio resting voltage.
   // ================================================================
   if (!s_safeMode && loraStatus == 1 && !wifiFlushed && !s_pauseFlush &&
       s_backlogPending) {
     esp_task_wdt_reset();
     crashStageSet(STAGE_LORA_FLUSH);
-    uint32_t loraFlushed = loraFlushPending(earlyBatV);
+    uint32_t loraFlushed = loraFlushPending(earlyBatV, s_flushCap);
     esp_task_wdt_reset();
     if (loraFlushed > 0) {
       Serial.printf("[LoRaFlush] Recovered %lu queued readings over LoRa\n",
@@ -796,9 +896,11 @@ void setup() {
   // ================================================================
   //  OLED update
   // ================================================================
-  uint32_t nextWifiIn = (s_wakeCount % WIFI_UPLOAD_EVERY_N == 0)
-                        ? WIFI_UPLOAD_EVERY_N
-                        : WIFI_UPLOAD_EVERY_N - (s_wakeCount % WIFI_UPLOAD_EVERY_N);
+  const uint32_t wifiEveryNext = (s_wifiFailStreak >= WIFI_FAIL_BACKOFF_AFTER)
+                                 ? WIFI_BACKOFF_EVERY_N : WIFI_UPLOAD_EVERY_N;
+  uint32_t nextWifiIn = (s_wakeCount % wifiEveryNext == 0)
+                        ? wifiEveryNext
+                        : wifiEveryNext - (s_wakeCount % wifiEveryNext);
 
   crashStageSet(STAGE_DISPLAY);
   displayData(data, sdReady(), loraStatus, wifiStatus, s_wakeCount, nextWifiIn);

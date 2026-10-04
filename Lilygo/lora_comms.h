@@ -5,10 +5,11 @@
 // Outcome of one loraSend() call. Lilygo.ino uses this to decide whether the
 // reading still needs the WiFi backup upload: only OK means "the gateway has it".
 enum class LoRaSendResult : uint8_t {
-  OK       = 0,   // transmitted AND a matching seq-echoed ACK came back
-  NO_ACK   = 1,   // transmitted OK but no matching ACK after all retries
-  TX_ERROR = 2,   // radio never accepted the packet for transmission
-  NOT_INIT = 3,   // loraInit() did not succeed this wake
+  OK            = 0,   // transmitted AND a matching seq-echoed ACK came back
+  NO_ACK        = 1,   // transmitted OK but no matching ACK after all retries
+  TX_ERROR      = 2,   // radio never accepted the packet for transmission
+  NOT_INIT      = 3,   // loraInit() did not succeed this wake
+  PAYLOAD_ERROR = 4,   // the reading doesn't fit one LoRa frame (never sent)
 };
 
 // Initialise the SX1262 on its dedicated HSPI bus (1.8 V TCXO, DIO2 RF switch,
@@ -16,8 +17,10 @@ enum class LoRaSendResult : uint8_t {
 bool           loraInit();
 
 // Build the JSON payload from `data`, transmit it, then wait (with retries) for
-// the gateway's "ACK:<seq>" echo. Returns the outcome enum above.
-LoRaSendResult loraSend(const SensorData& data, int32_t wifiRssi = 0);
+// the gateway's "ACK:<seq>" echo. maxAttempts = 0 → LORA_MAX_RETRIES (config.h);
+// a smaller value is used while the gateway has been silent for a while.
+// Returns the outcome enum above.
+LoRaSendResult loraSend(const SensorData& data, int32_t wifiRssi = 0, uint8_t maxAttempts = 0);
 
 // Put the SX1262 into sleep mode before deep sleep (~0.5 µA vs ~1.5 mA standby).
 void           loraShutdown();

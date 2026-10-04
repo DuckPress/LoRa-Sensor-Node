@@ -6,38 +6,90 @@
 #include <WiFi.h>
 #include <esp_task_wdt.h>
 
+// Consecutive LoRa-flush wakes whose FIRST send went unacknowledged even though
+// the live reading was ACKed moments earlier. A healthy link makes that rare, so
+// a streak points at the head entry itself; after LORA_FLUSH_SKIP_AFTER it is
+// moved to the tail so the rest of the backlog can drain. RTC RAM: spans wakes.
+RTC_DATA_ATTR static uint8_t s_loraHeadFails = 0;
+
 // ================================================================
-//  Convert one CSV line from the pending queue to its batch-upload query.
+//  Queue line format (no header, one reading per line):
 //
-//  Line format (no header, comma-separated):
-//    ts,dist_k,dist_raw,wl,temp,hum,bat[,sd,n,sm,mv]
-//  The trailing QC fields (burst std-dev, burst count, survey-mode flag,
-//  mount-moved flag) are optional so lines queued by older firmware still
-//  parse — they default to -1/0/0/0.
+//    N|ts,dist_k,dist_raw,wl,temp,hum,bat,sd,n,sm,mv,tl,pr,st,du,rv
 //
-//  rssi is set to 0 because WiFi was not connected when the reading
-//  was taken — the node only knew the LoRa channel quality at that
-//  time, which is not stored in the pending queue.
+//  N is a legacy per-line counter prefix, kept so the format stays readable by
+//  older firmware; it no longer decides anything. Every field after `bat` was
+//  added over time and is optional when READING, so lines queued by older
+//  firmware still parse:
+//    sd,n,sm,mv (QC) → -1,0,0,0     tl,pr (>= 1.2.9) → -1,-1
+//    st,du (>= 1.2.10) → 0,-1       rv (>= 1.2.11)   → see queuedRtcValid()
 // ================================================================
-// Returns false for a corrupt/unparseable line; re-queueing one forever would
-// stall the flush, while tidelog.csv still holds the complete record.
-static bool pendingLineToQuery(const String& line, String& queryOut) {
+struct QueuedReading {
+  char  ts[24];
+  bool  tsOk;                                   // ts is a well-formed clock stamp
+  float dist, distRaw, wl, temp, hum, bat, sd, tl, pr, du;
+  int   bn, sm, mv, st;
+  int   rv;                                     // -1 = line predates the rv field
+};
+
+// "YYYY-MM-DDTHH:MM:SS" with digits where digits belong — a real clock stamp,
+// not "UNKNOWN" or a torn/corrupt fragment.
+static bool tsWellFormed(const char* ts) {
+  if (strlen(ts) != 19) return false;
+  for (int i = 0; i < 19; i++) {
+    const char c = ts[i];
+    switch (i) {
+      case 4: case 7:   if (c != '-') return false; break;
+      case 10:          if (c != 'T') return false; break;
+      case 13: case 16: if (c != ':') return false; break;
+      default:          if (c < '0' || c > '9') return false; break;
+    }
+  }
+  return true;
+}
+
+// Parse the data part of one queue line (after the "N|" prefix). Returns false
+// for a corrupt/unparseable line. A malformed timestamp is replaced by
+// "UNKNOWN" so nothing but a clean stamp (or that sentinel) is ever sent on.
+static bool parseQueuedLine(const String& line, QueuedReading& q) {
   if (line.length() < 5) return false;
+  memset(&q, 0, sizeof(q));
+  q.dist = q.distRaw = q.wl = -1.0f;
+  q.temp = -999.0f; q.hum = -1.0f; q.bat = -1.0f;
+  q.sd = -1.0f; q.tl = -1.0f; q.pr = -1.0f; q.du = -1.0f;
+  q.rv = -1;
+  int parsed = sscanf(line.c_str(), "%23[^,],%f,%f,%f,%f,%f,%f,%f,%d,%d,%d,%f,%f,%d,%f,%d",
+                      q.ts, &q.dist, &q.distRaw, &q.wl, &q.temp, &q.hum, &q.bat,
+                      &q.sd, &q.bn, &q.sm, &q.mv, &q.tl, &q.pr, &q.st, &q.du, &q.rv);
+  if (parsed < 7 || q.ts[0] == '\0') return false;
+  q.tsOk = tsWellFormed(q.ts);
+  if (!q.tsOk) strcpy(q.ts, "UNKNOWN");
+  return true;
+}
 
-  char  ts[24] = { 0 };
-  float dist   = -1.0f, distRaw = -1.0f, wl  = -1.0f;
-  float temp   = -999.0f, hum   = -1.0f, bat = -1.0f;
-  float sd     = -1.0f, tl = -1.0f, pr = -1.0f;   // tl/pr absent on pre-1.2.9 lines
-  float du     = -1.0f;                            // st/du absent on pre-1.2.10 lines
-  int   bn     = 0, sm = 0, mv = 0, st = 0;
+// Was the queued reading's clock trusted when it was taken? Lines from firmware
+// >= 1.2.11 record it (rv). Older lines don't: a well-formed timestamp is taken
+// as valid (what the pre-1.2.11 LoRa flush already assumed); "UNKNOWN" or a
+// torn stamp never is.
+static int queuedRtcValid(const QueuedReading& q) {
+  if (!q.tsOk) return 0;
+  return (q.rv >= 0) ? (q.rv ? 1 : 0) : 1;
+}
 
-  int parsed = sscanf(line.c_str(), "%23[^,],%f,%f,%f,%f,%f,%f,%f,%d,%d,%d,%f,%f,%d,%f",
-                      ts, &dist, &distRaw, &wl, &temp, &hum, &bat,
-                      &sd, &bn, &sm, &mv, &tl, &pr, &st, &du);
-  if (parsed < 7 || ts[0] == '\0') return false;
+// ================================================================
+//  Build the batch-upload query for one queued reading. rssi=0: WiFi wasn't
+//  up when it was taken. rv/ev carry the clock/env validity exactly like a
+//  direct upload — without rv the cloud treats the row's node timestamp as
+//  untrusted, plotting a recovered reading at its UPLOAD time and excluding it
+//  from tide reduction. bf=1 marks it as a backlog re-send.
+//  Returns false for a corrupt/unparseable line.
+// ================================================================
+static bool pendingLineToQuery(const String& line, String& queryOut) {
+  QueuedReading q;
+  if (!parseQueuedLine(line, q)) return false;
 
-  char q[512];
-  int n = snprintf(q, sizeof(q),
+  char buf[512];
+  int n = snprintf(buf, sizeof(buf),
     "ts=%s"
     "&dist=%.2f"
     "&distRaw=%.2f"
@@ -46,6 +98,8 @@ static bool pendingLineToQuery(const String& line, String& queryOut) {
     "&hum=%.1f"
     "&bat=%.2f"
     "&rssi=0"
+    "&rv=%d"
+    "&ev=%d"
     "&id=%u"
     "&sd=%.2f"
     "&n=%d"
@@ -54,21 +108,121 @@ static bool pendingLineToQuery(const String& line, String& queryOut) {
     "&tl=%.1f"
     "&pr=%.1f"
     "&st=%d"
-    "&du=%.2f",
-    ts, dist, distRaw, wl, temp, hum, bat,
-    (unsigned)NODE_ID, sd, bn, sm, mv, tl, pr, st, du);
-  if (n <= 0 || (size_t)n >= sizeof(q)) return false;
+    "&du=%.2f"
+    "&bf=1",
+    q.ts, q.dist, q.distRaw, q.wl, q.temp, q.hum, q.bat,
+    queuedRtcValid(q), (q.temp > -100.0f) ? 1 : 0, (unsigned)NODE_ID,
+    q.sd, q.bn, q.sm, q.mv, q.tl, q.pr, q.st, q.du);
+  if (n <= 0 || (size_t)n >= sizeof(buf)) return false;
 
-  queryOut = q;
+  queryOut = buf;
   return true;
 }
 
 // ================================================================
-//  pendingAppend — append the current reading to /pending.csv (the WiFi-backup
-//  queue), called when LoRa didn't confirm delivery. Enforces the cap, dropping
-//  the newest reading when full (tidelog.csv on SD keeps the complete record).
+//  pendingLineToSensorData — reconstruct a SensorData from one queue line so it
+//  can be re-sent over LoRa. Validity flags come from the stored sentinels
+//  (-1 / -999) and the stored rv, the same way the live reading set them.
+//  backlog=true makes the payload carry "bf":1 (see SensorData::backlog).
+// ================================================================
+static bool pendingLineToSensorData(const String& line, SensorData& d) {
+  QueuedReading q;
+  if (!parseQueuedLine(line, q)) return false;
+
+  d = SensorData();   // start from defaults
+  strncpy(d.isoTimestamp, q.ts, sizeof(d.isoTimestamp) - 1);
+  d.distanceRaw   = q.distRaw;
+  d.distanceCm    = q.dist;
+  d.waterLevelCm  = q.wl;
+  d.distanceValid = (q.dist >= 0.0f);     // -1 sentinel => flagged (C1) reading
+  d.tempC         = q.temp;
+  d.humidity      = q.hum;
+  d.envValid      = (q.temp > -100.0f);   // -999 sentinel => env invalid
+  d.batV          = q.bat;
+  d.batValid      = (q.bat > 0.0f);
+  d.burstSd       = q.sd;
+  d.burstN        = (uint8_t)q.bn;
+  d.surveyMode    = (q.sm != 0);
+  d.moved         = (q.mv != 0);
+  d.tiltDeg       = q.tl;
+  d.pressureHpa   = q.pr;
+  // Dual-sensor fields (node >= 1.2.10). Older lines leave st=0/du=-1; the
+  // radar value is recoverable from distRaw when st says the radar was primary.
+  d.sensorType      = (q.st > 0 && q.st < SENSOR_TYPE_COUNT) ? (SensorType)q.st : SENSOR_TYPE_NONE;
+  d.distanceUsCm    = q.du;
+  d.distanceRadarCm = (d.sensorType == SENSOR_TYPE_LD2413) ? q.distRaw : -1.0f;
+  d.rtcValid      = (queuedRtcValid(q) == 1);
+  d.backlog       = true;
+  return true;
+}
+
+// ================================================================
+//  Read one '\n'-terminated line into `out` (newline stripped), never storing
+//  more than maxLen characters — a torn write or FAT damage can leave a
+//  "line" with no newline, which an unbounded reader would pull into RAM whole.
+//  Returns 1 = got a line, 0 = end of file, -1 = line exceeds maxLen (corrupt).
+// ================================================================
+static int readLineBounded(File& f, String& out, size_t maxLen) {
+  out = "";
+  if (!f.available()) return 0;
+  while (f.available()) {
+    const int c = f.read();
+    if (c < 0) break;
+    if (c == '\n') return 1;
+    if (out.length() >= maxLen) return -1;
+    out += (char)c;
+  }
+  return 1;   // last line without a trailing newline
+}
+
+// Split the legacy "N|data" prefix off a queue line. Lines written before the
+// prefix existed (no recognisable prefix) keep the whole line as data.
+static void splitPrefix(const String& line, uint8_t& prefix, String& data) {
+  prefix = 0;
+  data   = line;
+  int bar = line.indexOf('|');
+  if (bar > 0 && bar <= 3) {
+    String p = line.substring(0, bar);
+    for (unsigned int k = 0; k < p.length(); k++) {
+      if (!isDigit(p[k])) return;
+    }
+    prefix = (uint8_t)p.toInt();
+    data   = line.substring(bar + 1);
+  }
+}
+
+// The two flushes rewrite the queue through these temp files (see the end of
+// each): the kept remainder is written to the temp, the queue removed, and the
+// temp renamed over it.
+static const char* const PENDING_TMP = "/pending.tmp";    // WiFi flush
+static const char* const LORA_TMP    = "/pending.ltmp";   // LoRa flush
+
+// ================================================================
+//  recoverInterruptedFlush — heal a crash (brownout, watchdog) between a
+//  flush's "remove the queue" and "rename the temp over it": the queue is gone
+//  but the temp file holds the kept remainder. Runs before anything counts,
+//  appends to or flushes the queue — if a new reading started a fresh queue
+//  first, the remainder would be orphaned and the next flush would delete it.
+// ================================================================
+static void recoverInterruptedFlush() {
+  if (SD.exists(PENDING_FILENAME)) return;
+  const char* tmp = SD.exists(PENDING_TMP) ? PENDING_TMP
+                  : SD.exists(LORA_TMP)    ? LORA_TMP
+                  : nullptr;
+  if (tmp && SD.rename(tmp, PENDING_FILENAME)) {
+    Serial.printf("[Pending] Recovered queue from an interrupted flush (%s)\n", tmp);
+  }
+}
+
+// ================================================================
+//  pendingAppend — append the current reading to /pending.csv (the backlog
+//  queue), called when neither LoRa nor a direct upload delivered it. Enforces
+//  the cap, dropping the newest reading when full (tidelog.csv on SD keeps the
+//  complete record).
 // ================================================================
 void pendingAppend(const SensorData& data) {
+  recoverInterruptedFlush();   // before this append could start a fresh queue
+
   // Enforce the cap before opening the file for append so we never
   // exceed PENDING_MAX_ENTRIES even when the gateway is offline for
   // an extended period.
@@ -76,7 +230,7 @@ void pendingAppend(const SensorData& data) {
     // Queue full: drop this (newest) reading rather than the backlog.
     // No data is truly lost — tidelog.csv on SD holds the complete record.
     Serial.printf("[Pending] Queue full (%u) — dropping this reading "
-                  "until a WiFi flush succeeds\n", PENDING_MAX_ENTRIES);
+                  "until a flush succeeds\n", PENDING_MAX_ENTRIES);
     return;
   }
 
@@ -100,11 +254,8 @@ void pendingAppend(const SensorData& data) {
   }
 
   if (needsNewline) f.print('\n');
-  // Leading "0|" is the retry counter pendingFlush() maintains (see
-  // PENDING_MAX_RETRIES) — dropped entries are counted this way instead of
-  // being kept forever.
-  f.print("0|");
-  f.printf("%s,%.2f,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f,%u,%d,%d,%.1f,%.1f,%d,%.2f\n",
+  f.print("0|");   // legacy counter prefix (format compatibility only)
+  f.printf("%s,%.2f,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f,%u,%d,%d,%.1f,%.1f,%d,%.2f,%d\n",
     data.isoTimestamp,
     data.distanceValid ? data.distanceCm   : -1.0f,
     data.distanceValid ? data.distanceRaw  : -1.0f,
@@ -120,16 +271,16 @@ void pendingAppend(const SensorData& data) {
     data.tiltDeg,
     data.pressureHpa,
     (int)data.sensorType,     // node >= 1.2.10: primary sensor + ultrasonic
-    data.distanceUsCm);       //   distance ride at the end (older lines lack them)
+    data.distanceUsCm,        //   distance
+    data.rtcValid      ? 1 : 0);   // node >= 1.2.11: was the clock trusted?
   f.close();
 }
 
 // ================================================================
 //  quarantinePendingFile — move a corrupt queue aside instead of choking on it.
 //  A torn write or FAT damage can leave a record with no newline; rather than
-//  let readStringUntil() pull an unbounded blob into RAM or jam the flush
-//  forever, rename the file to PENDING_BAD_FILENAME (kept for forensics) and
-//  start fresh. tidelog.csv remains the complete record, so nothing is lost.
+//  jam the flush forever, rename the file to PENDING_BAD_FILENAME (kept for
+//  forensics) and start fresh. tidelog.csv remains the complete record.
 // ================================================================
 static void quarantinePendingFile() {
   SD.remove(PENDING_BAD_FILENAME);              // keep only the latest bad copy
@@ -161,20 +312,18 @@ uint32_t flushBudgetForVoltage(float batteryV) {
 
 // ================================================================
 //  pendingFlush — on a WiFi wake, upload queued readings oldest-first (up to
-//  a voltage-scaled per-wake budget), rewriting failed/over-budget entries
-//  back to the queue for the next wake. Returns the number uploaded.
+//  a voltage-scaled per-wake budget), rewriting the kept remainder back to the
+//  queue. Returns the number uploaded.
+//
+//  Failure rule (no outage may cost data): a transport or server failure keeps
+//  every entry unchanged and stops the flush; if nothing had been uploaded yet
+//  this wake the queue file isn't even rewritten. Only rows the cloud rejects
+//  as invalid ("bad" in the batch reply) are dropped.
 // ================================================================
 uint32_t pendingFlush(float batteryV, uint32_t capOverride) {
-  static const char* PENDING_TMP = "/pending.tmp";
-
-  // Recover from a crash between the remove and the rename at the bottom of a
-  // previous flush: the queue file is gone but the fully-written temp file
-  // still holds the kept entries. Do this BEFORE the budget check so an
-  // interrupted flush is always healed even on a wake that then defers.
-  if (!SD.exists(PENDING_FILENAME) && SD.exists(PENDING_TMP)) {
-    SD.rename(PENDING_TMP, PENDING_FILENAME);
-    Serial.println(F("[Pending] Recovered queue from interrupted flush"));
-  }
+  // Heal an interrupted earlier flush BEFORE the budget check, so it is healed
+  // even on a wake that then defers.
+  recoverInterruptedFlush();
 
   if (!SD.exists(PENDING_FILENAME)) return 0;
   if (WiFi.status() != WL_CONNECTED) {
@@ -202,9 +351,9 @@ uint32_t pendingFlush(float batteryV, uint32_t capOverride) {
   SD.remove(PENDING_TMP);                       // stale partial temp, if any
   File out = SD.open(PENDING_TMP, FILE_WRITE);
   if (!out) {
-    // Without the temp file, failed/deferred entries couldn't be preserved.
-    // Abort the whole flush and retry next wake instead of risking the
-    // backlog; nothing has been uploaded or deleted yet.
+    // Without the temp file, deferred entries couldn't be preserved. Abort the
+    // whole flush and retry next wake instead of risking the backlog; nothing
+    // has been uploaded or deleted yet.
     Serial.println(F("[Pending] Temp open failed — flush deferred"));
     in.close();
     return 0;
@@ -212,41 +361,45 @@ uint32_t pendingFlush(float batteryV, uint32_t capOverride) {
 
   uint32_t uploaded  = 0;
   uint32_t attempted = 0;
-  uint32_t kept      = 0;   // failed + over-budget entries preserved for retry
-  uint32_t dropped   = 0;   // corrupt lines discarded
+  uint32_t kept      = 0;   // failed + over-budget entries preserved for later
+  uint32_t dropped   = 0;   // corrupt lines + rows the cloud rejected as invalid
   bool stopAttempts  = false;
   bool sagChecked    = false;  // loaded-voltage re-check done once, after batch 1
+  bool abortNoChange = false;  // first batch failed → leave the queue untouched
 
   String batchRows;
   batchRows.reserve(PENDING_BATCH_MAX_BODY);
   String batchData[PENDING_BATCH_ENTRIES];
-  uint8_t batchRetries[PENDING_BATCH_ENTRIES] = { 0 };
+  uint8_t batchPrefix[PENDING_BATCH_ENTRIES] = { 0 };
   uint8_t batchCount = 0;
+
+  auto keepLine = [&](uint8_t prefix, const String& data) {
+    out.print(prefix); out.print('|'); out.print(data); out.print('\n'); kept++;
+  };
 
   auto flushBatch = [&]() {
     if (batchCount == 0) return;
     esp_task_wdt_reset();
+    const bool firstBatch = (attempted == 0);
     uint16_t badRows = 0;
     const bool ok = gasUploadBatch(batchRows, batchCount, badRows);
     attempted += batchCount;
     if (ok) {
       uploaded += batchCount - badRows;
-      dropped += badRows;
+      dropped  += badRows;
       if (badRows > 0) {
-        Serial.printf("[Pending] GAS rejected %u invalid batch row(s)\n", badRows);
+        Serial.printf("[Pending] Cloud rejected %u invalid row(s) — dropped\n", badRows);
       }
     } else {
+      // Transport/server failure — nothing is wrong with these rows. Keep them
+      // exactly as they are and stop for this wake.
       stopAttempts = true;
-      for (uint8_t i = 0; i < batchCount; i++) {
-        if (batchRetries[i] + 1 >= PENDING_MAX_RETRIES) {
-          Serial.printf("[Pending] Dropping entry after %u failed attempts: %s\n",
-                        batchRetries[i] + 1, batchData[i].c_str());
-          dropped++;
-        } else {
-          out.print(batchRetries[i] + 1); out.print('|');
-          out.print(batchData[i]); out.print('\n'); kept++;
-        }
+      if (firstBatch) {
+        abortNoChange = true;   // nothing uploaded yet: don't rewrite the file
+      } else {
+        for (uint8_t i = 0; i < batchCount; i++) keepLine(batchPrefix[i], batchData[i]);
       }
+      Serial.println(F("[Pending] Upload failed — backlog kept for the next flush"));
     }
     batchRows = "";
     batchCount = 0;
@@ -258,7 +411,7 @@ uint32_t pendingFlush(float batteryV, uint32_t capOverride) {
     // resting-fine-but-weak cell that sags under load is caught here and the
     // rest of the flush is deferred (see BAT_FLUSH_SAG_FLOOR_V). Only meaningful
     // for a real cell — an implausible USB-only reading is ignored.
-    if (!sagChecked) {
+    if (!sagChecked && !abortNoChange) {
       sagChecked = true;
       // Uncached read — getBatteryVoltage() would hand back the cached pre-radio
       // RESTING value and never see the sag this guard exists to catch.
@@ -273,55 +426,41 @@ uint32_t pendingFlush(float batteryV, uint32_t capOverride) {
     delay(300);
   };
 
-  while (in.available()) {
+  String line;
+  while (!abortNoChange) {
     // Every line does at least an SD read here, even lines that only get
-    // deferred (over budget / stopAttempts) below — flushBatch() feeds the
-    // watchdog while actively uploading, but a large backlog's deferred tail
-    // was being copied line-by-line with no feed at all, and could run long
-    // enough on its own to trip the 60 s watchdog (see the pendingCount()
-    // fix above for the same underlying issue).
+    // deferred (over budget / stopAttempts) below — a large backlog's deferred
+    // tail is copied line by line, so feed the watchdog on every line.
     esp_task_wdt_reset();
-    String line = in.readStringUntil('\n');
-    line.trim();
-    if (line.length() == 0) continue;
+    const int r = readLineBounded(in, line, PENDING_MAX_LINE_LEN);
+    if (r == 0) break;                          // end of file
 
     // Corruption guard: a valid record is well under PENDING_MAX_LINE_LEN. An
     // oversized "line" means a torn write / FAT damage left a record with no
     // newline — quarantine the whole queue rather than trust the rest of it.
-    if (line.length() >= PENDING_MAX_LINE_LEN) {
-      Serial.printf("[Pending] Oversized line (%u B) — queue corrupt\n",
-                    (unsigned)line.length());
+    if (r < 0) {
+      Serial.printf("[Pending] Line over %u B — queue corrupt\n",
+                    (unsigned)PENDING_MAX_LINE_LEN);
       in.close();
       out.close();
       SD.remove(PENDING_TMP);
       quarantinePendingFile();
       return uploaded;
     }
+    line.trim();
+    if (line.length() == 0) continue;
 
-    // Parse the "N|data" retry-count prefix (see PENDING_MAX_RETRIES).
-    // Tolerate lines written before this counter existed (no recognisable
-    // prefix) by treating them as retry 0.
-    uint8_t retries = 0;
-    String  data    = line;
-    int     bar     = line.indexOf('|');
-    if (bar > 0 && bar <= 3) {
-      String prefix = line.substring(0, bar);
-      bool   numeric = true;
-      for (unsigned int k = 0; k < prefix.length(); k++) {
-        if (!isDigit(prefix[k])) { numeric = false; break; }
-      }
-      if (numeric) { retries = (uint8_t)prefix.toInt(); data = line.substring(bar + 1); }
-    }
+    uint8_t prefix;
+    String  data;
+    splitPrefix(line, prefix, data);
 
     if (stopAttempts || attempted >= budget) {
       // Over this wake's (voltage-scaled) budget, or a sag/failure stopped the
-      // flush — defer to the next WiFi wake.
-      out.print(retries); out.print('|'); out.print(data); out.print('\n'); kept++;
+      // flush — defer to the next flush.
+      keepLine(prefix, data);
       continue;
     }
 
-    // Each entry is an HTTPS GET (seconds) + settle delay; reset the
-    // watchdog every entry to avoid a panic reset mid-recovery.
     String query;
     if (!pendingLineToQuery(data, query)) {
       // Corrupt line (torn write): dropping it is the only way the flush can
@@ -332,38 +471,44 @@ uint32_t pendingFlush(float batteryV, uint32_t capOverride) {
     }
     if (batchCount > 0 && batchRows.length() + 1 + query.length() > PENDING_BATCH_MAX_BODY) {
       flushBatch();
-      if (stopAttempts) {
-        out.print(retries); out.print('|'); out.print(data); out.print('\n'); kept++;
-        continue;
-      }
+      if (abortNoChange) break;
+      if (stopAttempts) { keepLine(prefix, data); continue; }
     }
     if (batchCount > 0) batchRows += '\n';
     batchRows += query;
-    batchData[batchCount] = data;
-    batchRetries[batchCount] = retries;
+    batchData[batchCount]   = data;
+    batchPrefix[batchCount] = prefix;
     batchCount++;
 
     const uint32_t remainingBudget = budget - attempted;
     if (batchCount >= PENDING_BATCH_ENTRIES || batchCount >= remainingBudget) {
       flushBatch();
+      if (abortNoChange) break;
     }
   }
-  flushBatch();
+  if (!abortNoChange) flushBatch();
   in.close();
   out.close();
 
+  if (abortNoChange) {
+    // The very first upload failed: the queue file is exactly as it was, so
+    // just discard the half-written temp copy (no SD rewrite during an outage).
+    SD.remove(PENDING_TMP);
+    return 0;
+  }
+
   // Replace the queue with the kept remainder (failed + deferred), or clear
-  // it. A crash between the remove and the rename is healed by the recovery
-  // check at the top of the next flush.
+  // it. A crash between the remove and the rename is healed by
+  // recoverInterruptedFlush() before the queue is next touched.
   SD.remove(PENDING_FILENAME);
   if (kept > 0 && SD.exists(PENDING_TMP)) {
     SD.rename(PENDING_TMP, PENDING_FILENAME);
-    Serial.printf("[Pending] Flushed %lu/%lu this wake; %lu still queued, %lu corrupt dropped\n",
+    Serial.printf("[Pending] Flushed %lu/%lu this wake; %lu still queued, %lu dropped\n",
                   (unsigned long)uploaded, (unsigned long)attempted,
                   (unsigned long)kept, (unsigned long)dropped);
   } else {
     SD.remove(PENDING_TMP);
-    Serial.printf("[Pending] Flushed %lu/%lu  queue cleared (%lu corrupt dropped)\n",
+    Serial.printf("[Pending] Flushed %lu/%lu  queue cleared (%lu dropped)\n",
                   (unsigned long)uploaded, (unsigned long)attempted,
                   (unsigned long)dropped);
   }
@@ -374,12 +519,13 @@ uint32_t pendingFlush(float batteryV, uint32_t capOverride) {
 //  pendingCount — number of queued entries (newline count), 0 if no file.
 //
 //  Reads in chunks rather than byte-by-byte: at PENDING_MAX_ENTRIES (7,500)
-//  the file can be ~600 KB, and a single-byte f.read() per SPI transaction
+//  the file can be ~750 KB, and a single-byte f.read() per SPI transaction
 //  over that many bytes can run long enough to trip the task watchdog with
 //  no feed in between — which panics (trigger_panic=true) and reboots the
 //  node mid-scan.
 // ================================================================
 uint32_t pendingCount() {
+  recoverInterruptedFlush();   // a queue mid-swap still counts
   if (!SD.exists(PENDING_FILENAME)) return 0;
 
   File f = SD.open(PENDING_FILENAME, FILE_READ);
@@ -399,67 +545,18 @@ uint32_t pendingCount() {
 }
 
 // ================================================================
-//  pendingLineToSensorData — reconstruct a SensorData from one queue line (the
-//  "data" part, after the retry prefix) so it can be re-sent over LoRa. Mirrors
-//  pendingLineToQuery's parse. Validity flags are inferred from the stored
-//  sentinels (-1 / -999) the same way the live reading set them. Returns false
-//  for a corrupt/unparseable line.
-// ================================================================
-static bool pendingLineToSensorData(const String& line, SensorData& d) {
-  if (line.length() < 5) return false;
-
-  char  ts[24] = { 0 };
-  float dist   = -1.0f, distRaw = -1.0f, wl  = -1.0f;
-  float temp   = -999.0f, hum   = -1.0f, bat = -1.0f;
-  float sd     = -1.0f, tl = -1.0f, pr = -1.0f;   // tl/pr absent on pre-1.2.9 lines
-  float du     = -1.0f;                            // st/du absent on pre-1.2.10 lines
-  int   bn     = 0, sm = 0, mv = 0, st = 0;
-
-  int parsed = sscanf(line.c_str(), "%23[^,],%f,%f,%f,%f,%f,%f,%f,%d,%d,%d,%f,%f,%d,%f",
-                      ts, &dist, &distRaw, &wl, &temp, &hum, &bat,
-                      &sd, &bn, &sm, &mv, &tl, &pr, &st, &du);
-  if (parsed < 7 || ts[0] == '\0') return false;
-
-  d = SensorData();   // start from defaults
-  strncpy(d.isoTimestamp, ts, sizeof(d.isoTimestamp) - 1);
-  d.distanceRaw   = distRaw;
-  d.distanceCm    = dist;
-  d.waterLevelCm  = wl;
-  d.distanceValid = (dist >= 0.0f);       // -1 sentinel => flagged (C1) reading
-  d.tempC         = temp;
-  d.humidity      = hum;
-  d.envValid      = (temp > -100.0f);     // -999 sentinel => env invalid
-  d.batV          = bat;
-  d.batValid      = (bat > 0.0f);
-  d.burstSd       = sd;
-  d.burstN        = (uint8_t)bn;
-  d.surveyMode    = (sm != 0);
-  d.moved         = (mv != 0);
-  d.tiltDeg       = tl;
-  d.pressureHpa   = pr;
-  // Dual-sensor fields (node >= 1.2.10). Older lines leave st=0/du=-1; the
-  // radar value is recoverable from distRaw when st says the radar was primary.
-  d.sensorType    = (st > 0 && st < SENSOR_TYPE_COUNT) ? (SensorType)st : SENSOR_TYPE_NONE;
-  d.distanceUsCm  = du;
-  d.distanceRadarCm = (d.sensorType == SENSOR_TYPE_LD2413) ? distRaw : -1.0f;
-  d.rtcValid      = true;                 // the queued ts is a real logged time
-  return true;
-}
-
-// ================================================================
 //  loraFlushPending — drain the pending queue over LoRa (oldest-first) through
 //  the gateway, for wakes the WiFi flush didn't handle. Crash-safe via the same
 //  temp-file rename pattern as pendingFlush(): a delivered entry is dropped, a
 //  NO_ACK stops the flush and the remainder is preserved for the next wake.
+//
+//  Never drops an entry for failing: an un-ACKed send keeps it unchanged (and,
+//  when it's the first send of the wake, leaves the file untouched). An entry
+//  too big for one LoRa frame stays queued for the WiFi flush and is skipped
+//  here. capOverride (0 = none) is the remote flush_cap.
 // ================================================================
-uint32_t loraFlushPending(float batteryV) {
-  static const char* LORA_TMP = "/pending.ltmp";
-
-  // Recover an interrupted flush (queue removed, temp holds the kept remainder).
-  if (!SD.exists(PENDING_FILENAME) && SD.exists(LORA_TMP)) {
-    SD.rename(LORA_TMP, PENDING_FILENAME);
-    Serial.println(F("[LoRaFlush] Recovered queue from interrupted flush"));
-  }
+uint32_t loraFlushPending(float batteryV, uint32_t capOverride) {
+  recoverInterruptedFlush();
   if (!SD.exists(PENDING_FILENAME)) return 0;
 
   // Same battery gate as the WiFi flush: defer entirely near cutoff so the LoRa
@@ -476,43 +573,43 @@ uint32_t loraFlushPending(float batteryV) {
   File out = SD.open(LORA_TMP, FILE_WRITE);
   if (!out) { in.close(); return 0; }
 
-  uint32_t sent = 0, kept = 0, dropped = 0;
-  bool           stop    = false;          // link down / budget hit => keep the rest
+  uint32_t sent = 0, kept = 0, dropped = 0, skipped = 0;
+  bool           stop          = false;    // link down / budget / cap => keep the rest
+  bool           abortNoChange = false;    // first send failed → queue untouched
+  String         rotated;                  // head entry moved to the tail (see s_loraHeadFails)
   const uint32_t startMs = millis();
 
-  while (in.available()) {
+  auto keepLine = [&](uint8_t prefix, const String& data) {
+    out.print(prefix); out.print('|'); out.print(data); out.print('\n'); kept++;
+  };
+
+  String line;
+  while (true) {
     esp_task_wdt_reset();
-    String line = in.readStringUntil('\n');
-    line.trim();
-    if (line.length() == 0) continue;
+    const int r = readLineBounded(in, line, PENDING_MAX_LINE_LEN);
+    if (r == 0) break;
 
     // Corruption guard (same as pendingFlush): an oversized "line" is a torn
     // write — quarantine the whole queue rather than trust the rest.
-    if (line.length() >= PENDING_MAX_LINE_LEN) {
-      Serial.printf("[LoRaFlush] Oversized line (%u B) — queue corrupt\n",
-                    (unsigned)line.length());
+    if (r < 0) {
+      Serial.printf("[LoRaFlush] Line over %u B — queue corrupt\n",
+                    (unsigned)PENDING_MAX_LINE_LEN);
       in.close(); out.close(); SD.remove(LORA_TMP);
       quarantinePendingFile();
       return sent;
     }
+    line.trim();
+    if (line.length() == 0) continue;
 
-    // Parse the "N|data" retry-count prefix (tolerate pre-counter lines as 0).
-    uint8_t retries = 0;
-    String  data    = line;
-    int     bar     = line.indexOf('|');
-    if (bar > 0 && bar <= 3) {
-      String prefix = line.substring(0, bar);
-      bool   numeric = true;
-      for (unsigned int k = 0; k < prefix.length(); k++) {
-        if (!isDigit(prefix[k])) { numeric = false; break; }
-      }
-      if (numeric) { retries = (uint8_t)prefix.toInt(); data = line.substring(bar + 1); }
-    }
+    uint8_t prefix;
+    String  data;
+    splitPrefix(line, prefix, data);
 
-    // Stopped (a NO_ACK earlier), or out of this wake's time budget: defer the
-    // rest of the queue unchanged to the next wake.
-    if (stop || (millis() - startMs) > LORA_FLUSH_BUDGET_MS) {
-      out.print(retries); out.print('|'); out.print(data); out.print('\n'); kept++;
+    // Stopped (a NO_ACK earlier), out of this wake's time budget, or at the
+    // remote cap: defer the rest of the queue unchanged to the next wake.
+    const bool capHit = (capOverride > 0 && sent >= capOverride);
+    if (stop || capHit || (millis() - startMs) > LORA_FLUSH_BUDGET_MS) {
+      keepLine(prefix, data);
       continue;
     }
 
@@ -526,28 +623,61 @@ uint32_t loraFlushPending(float batteryV) {
     }
 
     esp_task_wdt_reset();
-    LoRaSendResult r = loraSend(d, 0);
+    const LoRaSendResult res = loraSend(d, 0);
     esp_task_wdt_reset();
-    if (r == LoRaSendResult::OK) {
+
+    if (res == LoRaSendResult::OK) {
       sent++;                                // delivered + ACKed => drop from queue
-    } else {
-      // NO_ACK / TX error => gateway or link is down. Keep this entry (until it
-      // has failed too many times) and stop sending; copy it + the tail to temp.
-      if (retries + 1 >= PENDING_MAX_RETRIES) {
-        Serial.printf("[LoRaFlush] Dropping entry after %u failed attempts: %s\n",
-                      retries + 1, data.c_str());
-        dropped++;
-      } else {
-        out.print(retries + 1); out.print('|'); out.print(data); out.print('\n'); kept++;
-      }
-      stop = true;
+      s_loraHeadFails = 0;
+      continue;
     }
+    if (res == LoRaSendResult::PAYLOAD_ERROR) {
+      // Too big for one LoRa frame: it can't go this way, but the WiFi flush
+      // can carry it. Keep it in place and move on to the next entry.
+      keepLine(prefix, data);
+      skipped++;
+      continue;
+    }
+
+    // NO_ACK / TX error: the link that just ACKed the live reading dropped
+    // this one. Stop sending for this wake; nothing is dropped.
+    stop = true;
+    if (sent == 0 && dropped == 0) {
+      // First send of the wake failed and nothing has changed.
+      if (++s_loraHeadFails < LORA_FLUSH_SKIP_AFTER) {
+        abortNoChange = true;                // leave the queue file untouched
+        break;
+      }
+      // The same head entry keeps failing while the link is up — move it to
+      // the tail so the rest of the backlog isn't stuck behind it.
+      s_loraHeadFails = 0;
+      rotated = String(prefix) + '|' + data;
+      Serial.println(F("[LoRaFlush] Head entry keeps failing — moved to the tail"));
+      continue;
+    }
+    keepLine(prefix, data);
   }
+
+  if (abortNoChange) {
+    in.close(); out.close();
+    SD.remove(LORA_TMP);
+    Serial.printf("[LoRaFlush] No ACK for the first backlog entry (%u/%u) — queue unchanged\n",
+                  (unsigned)s_loraHeadFails, (unsigned)LORA_FLUSH_SKIP_AFTER);
+    return 0;
+  }
+  if (rotated.length() > 0) { out.print(rotated); out.print('\n'); kept++; }
   in.close();
   out.close();
 
+  // Nothing sent, dropped or moved (e.g. every entry was too big for LoRa):
+  // the queue is unchanged, so skip the rewrite.
+  if (sent == 0 && dropped == 0 && rotated.length() == 0) {
+    SD.remove(LORA_TMP);
+    return 0;
+  }
+
   // Replace the queue with the kept remainder, or clear it. A crash between the
-  // remove and the rename is healed by the recovery check at the top next wake.
+  // remove and the rename is healed by recoverInterruptedFlush() next wake.
   SD.remove(PENDING_FILENAME);
   if (kept > 0 && SD.exists(LORA_TMP)) {
     SD.rename(LORA_TMP, PENDING_FILENAME);
@@ -555,8 +685,9 @@ uint32_t loraFlushPending(float batteryV) {
     SD.remove(LORA_TMP);
   }
   if (sent > 0 || kept > 0 || dropped > 0) {
-    Serial.printf("[LoRaFlush] Sent %lu over LoRa; %lu still queued, %lu dropped\n",
-                  (unsigned long)sent, (unsigned long)kept, (unsigned long)dropped);
+    Serial.printf("[LoRaFlush] Sent %lu over LoRa; %lu still queued (%lu too big for LoRa), %lu dropped\n",
+                  (unsigned long)sent, (unsigned long)kept, (unsigned long)skipped,
+                  (unsigned long)dropped);
   }
   return sent;
 }

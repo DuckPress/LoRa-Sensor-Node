@@ -88,19 +88,27 @@ static void sensorBegin(SensorType t);
 static bool sensorProbe(SensorType t);
 
 // ================================================================
-//  Kalman filter state — persists across deep sleep in RTC RAM.
+//  Kalman filter state — ONE filter per distance sensor, persisted across
+//  deep sleep in RTC RAM. The radar and the ultrasonic never sit at the same
+//  reference height (and have different noise), so blending them in one
+//  estimate would turn every wake where the ultrasonic stands in for the radar
+//  into a held "spike" or a filter re-seed. Each sensor keeps its own
+//  estimate; the PRIMARY sensor's filtered value is the reading's distance.
+//
+//  elapsedSecs = seconds since that filter last INCORPORATED a measurement.
+//  sensorsSetSleepDuration() adds each wake's sleep gap to every filter; a
+//  filter resets it only when it actually folds a reading in, so wakes with an
+//  invalid measurement or a spike-held reading still grow its predicted
+//  uncertainty instead of being silently forgotten.
 // ================================================================
-RTC_DATA_ATTR static float   s_kalmanX            = 0.0f;
-RTC_DATA_ATTR static float   s_kalmanP            = KALMAN_P0;
-RTC_DATA_ATTR static bool    s_kalmanInit         = false;
-RTC_DATA_ATTR static uint8_t s_kalmanRejectStreak = 0;   // consecutive spike rejects
-
-// Seconds elapsed since the Kalman filter last INCORPORATED a measurement.
-// sensorsSetSleepDuration() adds each wake's sleep gap; the filter resets it
-// only when it actually folds a reading in. This way wakes with an invalid
-// measurement or a spike-held reading still grow the predicted uncertainty
-// instead of being silently forgotten. RTC RAM so it survives deep sleep.
-RTC_DATA_ATTR static uint32_t s_kalmanElapsedSecs = 0;
+struct KalmanState {
+  float    x;              // estimate (cm)
+  float    p;              // error covariance (cm²)
+  bool     init;           // seeded yet?
+  uint8_t  rejectStreak;   // consecutive spike rejects
+  uint32_t elapsedSecs;    // gap since the last incorporated measurement
+};
+RTC_DATA_ATTR static KalmanState s_kf[SENSOR_TYPE_COUNT] = {};
 
 // Last valid air temperature & humidity — used for the speed-of-sound
 // correction, and as a fallback when the SHT3x misses a wake.  Defaults are
@@ -126,7 +134,8 @@ static uint8_t g_burstN  = 0;
 //  gaps spanning invalid/spike-held wakes are not lost.
 // ================================================================
 void sensorsSetSleepDuration(uint32_t secs) {
-  s_kalmanElapsedSecs += (secs > 0) ? secs : 1;
+  const uint32_t s = (secs > 0) ? secs : 1;
+  for (uint8_t t = 0; t < SENSOR_TYPE_COUNT; t++) s_kf[t].elapsedSecs += s;
 }
 
 // ================================================================
@@ -145,19 +154,22 @@ void sensorsSetSleepDuration(uint32_t secs) {
 // When known, it directly measures this specific reading's noise/roughness,
 // so it replaces the fixed KALMAN_R estimate for the measurement-noise term:
 // a calm burst is trusted more than KALMAN_R assumed, a rough one less.
-static float kalmanUpdate(float z, float burstSd) {
-  // z = this wake's measurement (the temp-corrected trimmed-mean distance).
-  // NOMINAL_SLEEP_S = the cadence Q was tuned for (30 s); used to scale Q below.
+static float kalmanUpdate(SensorType t, float z, float burstSd) {
+  // z = this wake's measurement from sensor t (trimmed mean; the ultrasonic's
+  // is already speed-of-sound corrected). NOMINAL_SLEEP_S = the cadence Q is
+  // expressed per; used to scale Q by the real gap below.
   constexpr float NOMINAL_SLEEP_S = (float)(SLEEP_DURATION_US / 1000000ULL);
+  KalmanState& k  = s_kf[t];
+  const char*  nm = sensorTypeName(t);
 
   // First reading ever (or just after a re-seed): there is no prior estimate, so
   // adopt the measurement as the state and start "very unsure" (KALMAN_P0).
-  if (!s_kalmanInit) {
-    s_kalmanX            = z;           // state estimate   = the measurement
-    s_kalmanP            = KALMAN_P0;   // error covariance = large (unsure)
-    s_kalmanInit         = true;
-    s_kalmanRejectStreak = 0;
-    s_kalmanElapsedSecs  = 0;           // measurement incorporated — reset gap
+  if (!k.init) {
+    k.x            = z;           // state estimate   = the measurement
+    k.p            = KALMAN_P0;   // error covariance = large (unsure)
+    k.init         = true;
+    k.rejectStreak = 0;
+    k.elapsedSecs  = 0;           // measurement incorporated — reset gap
     return z;
   }
 
@@ -166,15 +178,15 @@ static float kalmanUpdate(float z, float burstSd) {
   // (almost always a blind-zone / multipath glitch) so it can't corrupt the
   // filter. If the deviation PERSISTS, it's a real shift (or a bad initial
   // seed), so re-seed to the new value with high uncertainty and resume.
-  if (fabsf(z - s_kalmanX) > SPIKE_REJECT_CM) {
+  if (fabsf(z - k.x) > SPIKE_REJECT_CM) {
     // Still within the allowed streak → treat as a one-off glitch: skip the
     // update entirely and return the last good estimate (one bad ping vanishes).
-    if (++s_kalmanRejectStreak < SPIKE_MAX_STREAK) {
-      Serial.printf("[Kalman] Spike %.1f cm vs est %.1f cm — held (%u/%u)\n",
-                    z, s_kalmanX, s_kalmanRejectStreak, SPIKE_MAX_STREAK);
-      // No measurement incorporated — leave s_kalmanElapsedSecs accumulating
-      // so the next accepted reading gets the full-gap process noise.
-      return s_kalmanX;                 // glitch — hold last estimate
+    if (++k.rejectStreak < SPIKE_MAX_STREAK) {
+      Serial.printf("[Kalman %s] Spike %.1f cm vs est %.1f cm — held (%u/%u)\n",
+                    nm, z, k.x, k.rejectStreak, SPIKE_MAX_STREAK);
+      // No measurement incorporated — leave elapsedSecs accumulating so the
+      // next accepted reading gets the full-gap process noise.
+      return k.x;                       // glitch — hold last estimate
     }
     // The jump has now repeated SPIKE_MAX_STREAK times. Before snapping to it,
     // apply the PHYSICAL rate-of-change gate: real water can't move this far
@@ -182,35 +194,35 @@ static float kalmanUpdate(float z, float burstSd) {
     // glitch (low burst_sd but wrong), so keep HOLDING the last good estimate
     // rather than corrupting the filter with it — unless it has persisted long
     // enough (RESEED_HARD_ACCEPT_STREAK) to be a genuine re-level.
-    float dtSecs  = (float)(s_kalmanElapsedSecs > 0 ? s_kalmanElapsedSecs : 1);
-    float rateCmS = fabsf(z - s_kalmanX) / dtSecs;
+    float dtSecs  = (float)(k.elapsedSecs > 0 ? k.elapsedSecs : 1);
+    float rateCmS = fabsf(z - k.x) / dtSecs;
     if (rateCmS > MAX_RATE_CM_PER_S &&
-        s_kalmanRejectStreak < RESEED_HARD_ACCEPT_STREAK) {
-      Serial.printf("[Kalman] Implausible rate %.2f cm/s (%.0f cm in %.0f s) — "
+        k.rejectStreak < RESEED_HARD_ACCEPT_STREAK) {
+      Serial.printf("[Kalman %s] Implausible rate %.2f cm/s (%.0f cm in %.0f s) — "
                     "holding, not re-seeding (%u/%u)\n",
-                    rateCmS, z - s_kalmanX, dtSecs,
-                    s_kalmanRejectStreak, RESEED_HARD_ACCEPT_STREAK);
-      return s_kalmanX;                 // transient glitch — keep the last good value
+                    nm, rateCmS, z - k.x, dtSecs,
+                    k.rejectStreak, RESEED_HARD_ACCEPT_STREAK);
+      return k.x;                       // transient glitch — keep the last good value
     }
     // Plausible shift (or it persisted long enough to be real): snap to it and
     // reset uncertainty to re-converge fast.
-    Serial.printf("[Kalman] Sustained shift to %.1f cm — re-seeding filter\n", z);
-    s_kalmanX            = z;           // real change / bad seed → snap to it
-    s_kalmanP            = KALMAN_P0;
-    s_kalmanRejectStreak = 0;
-    s_kalmanElapsedSecs  = 0;           // re-seed counts as incorporating z
-    return s_kalmanX;
+    Serial.printf("[Kalman %s] Sustained shift to %.1f cm — re-seeding filter\n", nm, z);
+    k.x            = z;                 // real change / bad seed → snap to it
+    k.p            = KALMAN_P0;
+    k.rejectStreak = 0;
+    k.elapsedSecs  = 0;                 // re-seed counts as incorporating z
+    return k.x;
   }
-  s_kalmanRejectStreak = 0;             // reading was in range → reset the streak
+  k.rejectStreak = 0;                   // reading was in range → reset the streak
 
   // ── Predict ──
   // PREDICT: grow the uncertainty by the process noise Q (how much the true
   // level could have drifted since the last INCORPORATED reading — accumulated
   // across any skipped/held wakes in between). A 120 s gap admits ~4× the
   // drift of a 30 s gap → the filter trusts a new reading more after long gaps.
-  float qScaled = KALMAN_Q * ((float)s_kalmanElapsedSecs / NOMINAL_SLEEP_S);
-  s_kalmanElapsedSecs = 0;              // gap consumed by this update
-  float pPred   = s_kalmanP + qScaled;  // predicted error covariance
+  float qScaled = KALMAN_Q * ((float)k.elapsedSecs / NOMINAL_SLEEP_S);
+  k.elapsedSecs = 0;                    // gap consumed by this update
+  float pPred   = k.p + qScaled;        // predicted error covariance
 
   // ── Update ──
   // UPDATE: the Kalman gain K ∈ [0,1] balances model vs measurement — K→1 when
@@ -224,11 +236,11 @@ static float kalmanUpdate(float z, float burstSd) {
     float r = burstSd * burstSd;
     rMeas = (r > KALMAN_R_MIN) ? r : KALMAN_R_MIN;
   }
-  float K   = pPred / (pPred + rMeas);             // Kalman gain
-  s_kalmanX = s_kalmanX + K * (z - s_kalmanX);     // corrected estimate
-  s_kalmanP = (1.0f - K) * pPred;                  // reduced uncertainty
+  float K = pPred / (pPred + rMeas);   // Kalman gain
+  k.x     = k.x + K * (z - k.x);        // corrected estimate
+  k.p     = (1.0f - K) * pPred;         // reduced uncertainty
 
-  return s_kalmanX;
+  return k.x;
 }
 
 // ================================================================
@@ -470,6 +482,14 @@ void sensorsInit() {
       Serial.println(F("[RTC] Lost power — seeding with compile time (local)"));
       DateTime compileLocal(F(__DATE__), F(__TIME__));
       rtc.adjust(compileLocal);
+      // The build time is only a placeholder (days to months old). Mark the
+      // clock UNVERIFIED in NVS — adjust() just cleared the DS3231's own
+      // lost-power flag, so later boots couldn't tell — and readings carry
+      // rtc_valid=0 until NTP or a gateway ACK sets real time (rtcMarkSynced).
+      Preferences cp;
+      cp.begin("clk", false);
+      cp.putUChar("unver", 1);
+      cp.end();
     }
     Serial.println(F("[Sensor] DS3231 OK"));
   }
@@ -499,6 +519,39 @@ bool rtcSyncIfDrifted(uint32_t localEpoch, int32_t maxSkewSec) {
   }
   Serial.printf("[RTC] in sync with NTP (skew %ld s)\n", (long)skew);
   return false;
+}
+
+// ================================================================
+//  rtcTimeTrusted / rtcMarkSynced — clock-trust bookkeeping (C2). The last
+//  sync time and the "unverified since power loss" flag live in NVS, so they
+//  survive the resets that wipe RTC RAM.
+// ================================================================
+bool rtcTimeTrusted(uint32_t localEpoch, const char** reasonOut) {
+  Preferences p;
+  p.begin("clk", true);                       // read-only
+  const uint32_t lastSync = p.getUInt("lastsync", 0);
+  const bool     unver    = p.getUChar("unver", 0) != 0;
+  p.end();
+
+  const char* why = nullptr;
+  if (unver) {
+    why = "re-seeded from build time after power loss, not synced since";
+  } else if (lastSync != 0 && (uint64_t)localEpoch + RTC_BACKWARD_TOLERANCE_SEC < lastSync) {
+    why = "earlier than the last successful sync";
+  } else if (lastSync != 0 && localEpoch > lastSync &&
+             (localEpoch - lastSync) > MAX_RTC_UNSYNCED_SEC) {
+    why = "unsynced for longer than MAX_RTC_UNSYNCED_SEC";
+  }
+  if (reasonOut) *reasonOut = why;
+  return why == nullptr;
+}
+
+void rtcMarkSynced(uint32_t localEpoch) {
+  Preferences p;
+  p.begin("clk", false);
+  p.putUInt("lastsync", localEpoch);
+  if (p.getUChar("unver", 0) != 0) p.putUChar("unver", 0);
+  p.end();
 }
 
 // ================================================================
@@ -728,7 +781,9 @@ static void sensorBegin(SensorType t) {
     case SENSOR_TYPE_RCWL1670:
       pinMode(PIN_RCWL_TRIG, OUTPUT);
       digitalWrite(PIN_RCWL_TRIG, LOW);
-      pinMode(PIN_RCWL_ECHO, INPUT);
+      // Pull-down: with no sensor fitted the ECHO line would float, and noise
+      // on it could pass for an echo during the probe.
+      pinMode(PIN_RCWL_ECHO, INPUT_PULLDOWN);
       break;
 #endif
     default:
@@ -751,6 +806,9 @@ static bool sensorProbe(SensorType t) {
 #endif
 #if defined(ENABLE_SENSOR_RCWL1670)
     case SENSOR_TYPE_RCWL1670: {
+      // Confirm only on >= 2 in-range echoes out of 5 pings: one stray edge on
+      // the ECHO line must not "detect" an ultrasonic that isn't fitted.
+      uint8_t hits = 0;
       for (uint8_t k = 0; k < 5; k++) {                     // fire a few pings
         esp_task_wdt_reset();
         digitalWrite(PIN_RCWL_TRIG, LOW);  delayMicroseconds(2);
@@ -759,7 +817,7 @@ static bool sensorProbe(SensorType t) {
         unsigned long d = pulseIn(PIN_RCWL_ECHO, HIGH, RCWL1670_ECHO_TIMEOUT_US);
         if (d > 0) {
           float cm = d * 0.0343f / 2.0f;
-          if (cm >= RCWL1670_MIN_CM && cm <= RCWL1670_MAX_CM) return true;
+          if (cm >= RCWL1670_MIN_CM && cm <= RCWL1670_MAX_CM && ++hits >= 2) return true;
         }
         delay(RCWL1670_INTER_SAMPLE_MS);
       }
@@ -1069,9 +1127,11 @@ static bool readSHT3x(float& tempC, float& humidity) {
 static bool readRTC(char* buf24, uint32_t& epochOut) {
   DateTime now = rtc.now();
   if (!now.isValid()) return false;
+  // Each field reduced to its printed width (a valid DateTime is 2000-2099
+  // anyway) so the 19-character stamp provably fits the 24-byte buffer.
   snprintf(buf24, 24, "%04d-%02d-%02dT%02d:%02d:%02d",
-           now.year(), now.month(), now.day(),
-           now.hour(), now.minute(), now.second());
+           now.year() % 10000, now.month() % 100, now.day() % 100,
+           now.hour() % 100, now.minute() % 100, now.second() % 100);
   epochOut = now.unixtime();
   return true;
 }
@@ -1086,9 +1146,10 @@ static bool readRTC(char* buf24, uint32_t& epochOut) {
 //    3. Speed-of-sound correct the ULTRASONIC: corrected = raw × c(T,RH)/0.0343
 //       Falls back to last good T/RH if the env sensor misses this wake.
 //       Not applied to the LD2413 radar (its range is temp/humidity-independent).
-//    4. Primary = first valid sensor in preference order (radar, then
-//       ultrasonic) → 1-D Kalman (sleep-scaled Q, spike-gated) → distanceCm.
-//       Both per-sensor values are kept on the reading for cross-checking.
+//    4. Every valid burst updates its OWN sensor's 1-D Kalman filter
+//       (sleep-scaled Q, spike-gated). Primary = first valid sensor in
+//       preference order (radar, then ultrasonic); its estimate → distanceCm.
+//       Both per-sensor trimmed means are kept on the reading for cross-checks.
 //    5. waterLevelCm = SENSOR_HEIGHT_CM − distanceCm
 // ================================================================
 SensorReadResult readAllSensors(SensorData& out) {
@@ -1202,11 +1263,16 @@ SensorReadResult readAllSensors(SensorData& out) {
   out.pressureHpa = readPressureHpa();
   if (out.pressureHpa > 0.0f) Serial.printf("[Baro] %.1f hPa\n", out.pressureHpa);
 
-  if (out.distanceValid) {
-    out.distanceCm = kalmanUpdate(rawDist, g_burstSd);
-  } else {
-    out.distanceCm = -1.0f;
+  // Per-sensor Kalman: EVERY sensor with a valid burst updates its own filter
+  // (so the ultrasonic's stays warm for a wake where it has to stand in for the
+  // radar); the primary sensor's estimate is the reading's distance.
+  float filtered[SENSOR_TYPE_COUNT];
+  for (uint8_t t = 0; t < SENSOR_TYPE_COUNT; t++) filtered[t] = -1.0f;
+  for (uint8_t i = 0; i < SENSOR_ORDER_N; i++) {
+    const SensorType t = SENSOR_ORDER[i];
+    if (raw[t] > 0.0f) filtered[t] = kalmanUpdate(t, raw[t], sd[t]);
   }
+  out.distanceCm = out.distanceValid ? filtered[out.sensorType] : -1.0f;
 
   // Step 5 — water level (uses Kalman-filtered, temp-corrected distance).
   // The speed-of-sound correction can push the distance slightly past

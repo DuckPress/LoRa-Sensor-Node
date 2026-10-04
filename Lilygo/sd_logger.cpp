@@ -5,6 +5,22 @@
 
 static bool s_sdReady = false;
 
+// First free name for rolling an old-schema log aside: LOG_ROLLED_FILENAME,
+// then LOG_ROLLED_PATTERN with 2..99. A roll must NEVER delete an earlier roll
+// — the SD card is the node's complete record, and every firmware schema
+// change produces one. Returns false only if all 99 names are taken.
+static bool pickRolledName(char* out, size_t outSize) {
+  if (!SD.exists(LOG_ROLLED_FILENAME)) {
+    snprintf(out, outSize, "%s", LOG_ROLLED_FILENAME);
+    return true;
+  }
+  for (int i = 2; i <= 99; i++) {
+    snprintf(out, outSize, LOG_ROLLED_PATTERN, i);
+    if (!SD.exists(out)) return true;
+  }
+  return false;
+}
+
 // ================================================================
 //  sdInit — mount the MicroSD on the shared FSPI bus, create /tidelog.csv with
 //  its header if missing, and confirm it is appendable. Retries the mount once.
@@ -29,8 +45,9 @@ void sdInit() {
   // new-format rows under an old header produces one file with mixed schemas
   // that every downstream parser (tide_reduce.html included) silently misreads
   // — exactly what happened on the field card (7/10/14-column rows in one file).
-  // Roll the mismatched file aside to a single backup and start a clean one so
-  // every tidelog.csv is internally consistent from here on.
+  // Roll the mismatched file aside under the first free archive name (earlier
+  // rolls are kept) and start a clean one, so every tidelog.csv is internally
+  // consistent from here on.
   if (SD.exists(LOG_FILENAME)) {
     File hf = SD.open(LOG_FILENAME, FILE_READ);
     if (hf) {
@@ -40,11 +57,14 @@ void sdInit() {
       String want = String(LOG_HEADER);
       want.trim();
       if (existing != want) {
-        Serial.println(F("[SD] tidelog.csv header differs from firmware schema "
-                         "— rolling old file to /tidelog_old.csv"));
-        SD.remove(LOG_ROLLED_FILENAME);          // keep only the latest backup
-        if (!SD.rename(LOG_FILENAME, LOG_ROLLED_FILENAME)) {
-          Serial.println(F("[SD] WARNING: could not roll old log — leaving as-is"));
+        char rolled[32];
+        if (!pickRolledName(rolled, sizeof(rolled))) {
+          Serial.println(F("[SD] WARNING: header differs but no free tidelog_old name — leaving as-is"));
+        } else {
+          Serial.printf("[SD] tidelog.csv header differs from firmware schema — rolling it to %s\n", rolled);
+          if (!SD.rename(LOG_FILENAME, rolled)) {
+            Serial.println(F("[SD] WARNING: could not roll old log — leaving as-is"));
+          }
         }
       }
     }

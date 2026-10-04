@@ -18,5 +18,7 @@ bool gasFetch(const char* query, String& bodyOut);
 // Upload newline-delimited query-string rows through the Apps Script batch
 // endpoint. `expectedRows` must match the number of lines. Returns true only
 // when GAS explicitly accounted for every row; `badRows` are permanently
-// invalid rows GAS rejected, not a transport failure.
+// invalid rows GAS rejected (drop them), not a transport failure. A batch the
+// cloud refuses as a whole ("reject":true, e.g. undecodable) counts as all-bad.
+// false = transport/server failure: keep every row and retry later.
 bool gasUploadBatch(const String& rows, uint16_t expectedRows, uint16_t& badRows);

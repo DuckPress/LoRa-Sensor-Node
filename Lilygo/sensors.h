@@ -19,8 +19,9 @@ enum SensorType : uint8_t {
 //  Aggregated reading from all sensors
 // ----------------------------------------------------------------
 struct SensorData {
-  // Ultrasonic — raw = trimmed-mean of 20 samples
-  //              distanceCm = Kalman-filtered (persists across deep sleep)
+  // PRIMARY distance sensor (see sensorType below):
+  //   distanceRaw = this wake's trimmed-mean burst
+  //   distanceCm  = that sensor's own Kalman estimate (persists across deep sleep)
   float    distanceRaw   = -1.0f;  // trimmed-mean distance before Kalman
   float    distanceCm    = -1.0f;  // Kalman-filtered distance (transmitted)
   bool     distanceValid = false;
@@ -80,6 +81,11 @@ struct SensorData {
 
   // Freshness — set to millis() at end of readAllSensors()
   uint32_t capturedAtMs = 0;
+
+  // Transport flag, not a measurement: true when this reading is a backlog
+  // re-send from the pending queue. The LoRa payload then carries "bf":1 so
+  // the cloud dedups it on (id, node timestamp) — its sequence number is new.
+  bool     backlog = false;
 };
 
 // ----------------------------------------------------------------
@@ -132,6 +138,19 @@ void             sensorsSetSurveyMode(bool on);
 // more than maxSkewSec. Returns true if the RTC was (re)set. Only meaningful
 // while the sensor I2C bus is up.
 bool             rtcSyncIfDrifted(uint32_t localEpoch, int32_t maxSkewSec);  // local = UTC+8
+
+// Clock trust (C2): may this wake's RTC time be used as the measurement time?
+// False when the DS3231 was re-seeded from the firmware build time after
+// losing power and hasn't been synced since, when it reads EARLIER than the
+// last successful sync (beyond RTC_BACKWARD_TOLERANCE_SEC), or when it has
+// gone longer than MAX_RTC_UNSYNCED_SEC without a sync. reasonOut (optional)
+// gets a short human-readable cause.
+bool             rtcTimeTrusted(uint32_t localEpoch, const char** reasonOut = nullptr);
+
+// Record a successful sync (NTP or a gateway ACK carrying its clock): stores
+// the sync time for the staleness check and clears the "unverified" flag set
+// when the RTC was re-seeded after a power loss.
+void             rtcMarkSynced(uint32_t localEpoch);
 
 // End Wire1 (sensor I2C bus) before deep sleep to stop current leaking
 // through the pull-up resistors.

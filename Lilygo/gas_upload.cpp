@@ -125,7 +125,16 @@ bool gasUploadBatch(const String& rows, uint16_t expectedRows, uint16_t& badRows
 
   String query = "action=batch&b=" + base64UrlEncode(rows);
   String body;
-  if (!gasFetch(query.c_str(), body)) return false;
+  if (!gasFetch(query.c_str(), body)) {
+    // The cloud read the batch and refused it permanently (it could not even
+    // be decoded) — resending the same bytes can never succeed, so report
+    // every row as bad for the caller to drop (tidelog.csv keeps them).
+    if (body.startsWith("{\"ok\":false") && body.indexOf("\"reject\":true") >= 0) {
+      badRows = expectedRows;
+      return true;
+    }
+    return false;
+  }
 
   const int written = jsonUint(body, "written");
   const int dup     = jsonUint(body, "dup");

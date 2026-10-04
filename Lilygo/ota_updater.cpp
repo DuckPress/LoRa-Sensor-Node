@@ -107,7 +107,10 @@ static void onOTAProgress(int current, int total) {
 void otaInit() {
   if (s_initDone) return;
   httpUpdate.onProgress(onOTAProgress);
-  httpUpdate.rebootOnUpdate(true);
+  // Reboot ourselves after a verified flash (see checkForOTAUpdate): the
+  // "flashed" marker must be written between a successful update and the
+  // restart, which rebootOnUpdate(true) wouldn't allow.
+  httpUpdate.rebootOnUpdate(false);
   // GitHub's release-asset download URL 302-redirects; without this the
   // firmware.bin fetch dies on the redirect on some core versions.
   httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
@@ -139,21 +142,27 @@ bool checkForOTAUpdate() {
     return false;
   }
 
-  // Refuse to re-attempt a version we already flashed once: if version.txt
-  // says X but the published firmware.bin still reports an older
-  // FIRMWARE_VERSION, the node would otherwise reflash the same image on
-  // every OTA wake forever. NVS survives both reboots and power loss.
+  // Refuse to re-flash a version we already flashed SUCCESSFULLY: if
+  // version.txt says X but the published firmware.bin still reports an older
+  // FIRMWARE_VERSION, the node would otherwise reflash the same image on every
+  // OTA check forever. The marker is written only after a verified flash —
+  // never before the download — so a brownout, watchdog reset or dropped
+  // connection mid-download can't block that version for good.
+  // NVS survives both reboots and power loss.
   Preferences prefs;
   prefs.begin("ota", false);
-  String lastTry = prefs.getString("lastTry", "");
-  if (lastTry == remoteStr) {
-    prefs.end();
-    Serial.printf("[OTA] %s was already attempted — skipping. Does the "
-                  "binary's FIRMWARE_VERSION match version.txt?\n", remoteStr);
+  // Firmware before 1.2.11 wrote "lastTry" BEFORE downloading, so a download
+  // that died mid-way left a marker that would block that version forever.
+  // It carries no information about a completed flash — discard it.
+  if (prefs.isKey("lastTry")) prefs.remove("lastTry");
+  String flashed = prefs.getString("flashed", "");
+  prefs.end();
+  if (flashed == remoteStr) {
+    Serial.printf("[OTA] %s was already flashed once and we're still on %s — "
+                  "skipping. Does the binary's FIRMWARE_VERSION match version.txt?\n",
+                  remoteStr, FIRMWARE_VERSION);
     return false;
   }
-  prefs.putString("lastTry", remoteStr);
-  prefs.end();
 
   Serial.printf("[OTA] Updating %s → %s\n", FIRMWARE_VERSION, remoteStr);
   displayOTAProgress(0);
@@ -176,22 +185,25 @@ bool checkForOTAUpdate() {
 
   switch (ret) {
     case HTTP_UPDATE_OK:
+      // The new image is written and verified; record it BEFORE restarting so
+      // a mislabelled binary can't cause an endless re-flash loop.
+      prefs.begin("ota", false);
+      prefs.putString("flashed", remoteStr);
+      prefs.end();
       Serial.println(F("[OTA] Success — rebooting"));
-      delay(1000);
+      Serial.flush();
+      delay(500);
       ESP.restart();
       return true;
     case HTTP_UPDATE_NO_UPDATES:
       Serial.println(F("[OTA] No update (unexpected)"));
       return false;
     default:
+      // Transient failure (network/TLS hiccup, power dip): nothing was
+      // recorded, so this version is simply retried on the next check.
       Serial.printf("[OTA] FAILED (%d): %s\n",
                     httpUpdate.getLastError(),
                     httpUpdate.getLastErrorString().c_str());
-      // Transient failure (network/TLS hiccup) — clear the marker so this
-      // version can be retried on the next OTA wake.
-      prefs.begin("ota", false);
-      prefs.remove("lastTry");
-      prefs.end();
       return false;
   }
 }

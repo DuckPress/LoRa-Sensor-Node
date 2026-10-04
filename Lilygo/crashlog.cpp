@@ -55,7 +55,34 @@ uint8_t crashBootBegin(esp_reset_reason_t reason) {
     Serial.printf("[Crash] Previous run was in stage %s when it reset (%s)\n",
                   crashStageName(s_prevStage), s_reasonStr);
   }
+  // A crash-type reset means a FRESH core dump was just written (it replaces
+  // any older one). Only THIS boot knows why and where the node died — the
+  // dump may wait several wakes for a WiFi upload, by which time the reset
+  // reason reads DEEPSLEEP and the breadcrumb SLEEP — so pin both in NVS now,
+  // and re-arm the one-time SD log for the new dump.
+  if (reason == ESP_RST_PANIC || reason == ESP_RST_TASK_WDT ||
+      reason == ESP_RST_INT_WDT || reason == ESP_RST_WDT) {
+    Preferences p;
+    p.begin("crash", false);
+    p.putString("rsn", s_reasonStr);
+    p.putUChar("stg", s_prevStage);
+    p.putUChar("sdlog", 0);
+    p.end();
+  }
   return s_prevStage;
+}
+
+// Reason + stage of the crash that produced the stored dump (pinned in NVS at
+// the first boot after it), falling back to this boot's values if absent.
+static void crashIdentity(char* rsn, size_t n, uint8_t& stage) {
+  Preferences p;
+  p.begin("crash", true);                       // read-only
+  String r = p.getString("rsn", "");
+  stage    = p.getUChar("stg", s_prevStage);
+  p.end();
+  strncpy(rsn, r.length() ? r.c_str() : s_reasonStr, n - 1);
+  rsn[n - 1] = '\0';
+  if (stage >= STAGE__COUNT) stage = STAGE_NONE;
 }
 
 // ---- Core dump summary -----------------------------------------------------
@@ -112,11 +139,12 @@ static bool buildQuery(char* out, size_t outSize, const char* isoTs) {
   char task[17]; strncpy(task, sum.exc_task, 16); task[16] = '\0'; sanitize(task);
   char bt[16 * 9 + 1]; formatBacktrace(sum, bt, sizeof(bt));
   char sha[17]; strncpy(sha, (const char*)sum.app_elf_sha256, 16); sha[16] = '\0'; sanitize(sha);
+  char rsn[12]; uint8_t stage; crashIdentity(rsn, sizeof(rsn), stage);
   int n = snprintf(out, outSize,
     "action=crash&id=%u&fw=%s&ts=%s&reason=%s&stage=%s"
     "&exc=%lu&excn=%s&task=%s&pc=%08lx&vaddr=%08lx&bt=%s&depth=%lu&corrupt=%d&sha=%s",
     (unsigned)NODE_ID, FIRMWARE_VERSION, isoTs ? isoTs : "",
-    s_reasonStr, crashStageName(s_prevStage),
+    rsn, crashStageName(stage),
     (unsigned long)sum.ex_info.exc_cause, excCauseName(sum.ex_info.exc_cause),
     task, (unsigned long)sum.exc_pc, (unsigned long)sum.ex_info.exc_vaddr,
     bt, (unsigned long)sum.exc_bt_info.depth, sum.exc_bt_info.corrupted ? 1 : 0, sha);
@@ -135,15 +163,16 @@ void crashLogToSdOnce(const char* isoTs, uint32_t wakeCount) {
       char task[17]; strncpy(task, sum.exc_task, 16); task[16] = '\0'; sanitize(task);
       char bt[16 * 9 + 1]; formatBacktrace(sum, bt, sizeof(bt));
       for (char* c = bt; *c; c++) if (*c == ',') *c = ' ';   // CSV-safe
+      char rsn[12]; uint8_t stage; crashIdentity(rsn, sizeof(rsn), stage);
       char line[320];
       snprintf(line, sizeof(line), "%s,%s,%lu,%s,%s,%s,%08lx,%s,%.16s",
-               s_reasonStr, crashStageName(s_prevStage),
+               rsn, crashStageName(stage),
                (unsigned long)sum.ex_info.exc_cause, excCauseName(sum.ex_info.exc_cause),
                task, sum.exc_bt_info.corrupted ? "corrupt" : "ok",
                (unsigned long)sum.exc_pc, bt, (const char*)sum.app_elf_sha256);
       if (sdLogCrashEvent(isoTs, wakeCount, line)) p.putUChar("sdlog", 1);
       Serial.printf("[Crash] Core dump found: %s in %s at pc=%08lx (%s), %lu frames\n",
-                    s_reasonStr, task, (unsigned long)sum.exc_pc,
+                    rsn, task, (unsigned long)sum.exc_pc,
                     excCauseName(sum.ex_info.exc_cause),
                     (unsigned long)sum.exc_bt_info.depth);
     }
@@ -164,7 +193,7 @@ bool crashUploadIfAny(const char* isoTs) {
   esp_core_dump_image_erase();
   Preferences p;
   p.begin("crash", false);
-  p.putUChar("sdlog", 0);
+  p.clear();                                    // reason/stage/sdlog of the uploaded dump
   p.end();
   Serial.println(F("[Crash] Summary uploaded — dump erased"));
   return true;

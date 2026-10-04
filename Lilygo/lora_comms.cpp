@@ -110,12 +110,15 @@ static uint32_t msToRadioTicks(uint32_t ms) { return ms * 64UL; }
 //    du  — RCWL-1670 ultrasonic distance (cm, speed-of-sound corrected),
 //          -1 = absent/empty. With st, both sensors are recoverable: the
 //          radar's value is dr when st=2.                  (node >= 1.2.10)
+//    bf  — 1 = backlog re-send from the pending queue (only present then);
+//          the cloud dedups it on (id, ts) since its seq is new (>= 1.2.11)
 //
 //  Size budget: the SX1262 frame is 255 bytes. A typical payload is ~205
 //  bytes; with EVERY field at its widest (t=-999.00, seq=65535, tl=180.0,
 //  pr=1100.0, ...) it is 216, and the optional 32-char token adds 39 — i.e.
-//  the absolute worst case lands exactly on the limit. Keep any new field
-//  short-keyed and low-precision, and re-check this sum when adding one.
+//  the absolute worst case lands exactly on the limit (a backlog re-send adds
+//  7 more; one that no longer fits is left for the WiFi flush). Keep any new
+//  field short-keyed and low-precision, and re-check this sum when adding one.
 // ================================================================
 static size_t buildPayload(char* buf, size_t bufSize,
                            const SensorData& data,
@@ -172,6 +175,18 @@ static size_t buildPayload(char* buf, size_t bufSize,
   // Append the shared-secret auth token ("k") only when one is configured, so
   // an empty token keeps the payload byte-identical to older firmware. The
   // gateway requires this to match before it ACKs/uploads the packet.
+  // Backlog re-send marker (only on queue re-sends, so live payloads keep their
+  // size): lets the cloud recognise a reading it may already hold under an
+  // older sequence number.
+  if (data.backlog) {
+    int m = snprintf(buf + n, bufSize - n, ",\"bf\":1");
+    if (m <= 0 || (size_t)(n + m) >= bufSize) {
+      Serial.println(F("[LoRa] Payload truncated (bf)!"));
+      return 0;
+    }
+    n += m;
+  }
+
   const char* loraToken = secretLoraToken();
   if (loraToken[0] != '\0') {
     int m = snprintf(buf + n, bufSize - n, ",\"k\":\"%s\"", loraToken);
@@ -214,16 +229,20 @@ static void redactTokenForLog(const char* payload, char* out, size_t outSize) {
 //  LORA_MAX_RETRIES. The sequence number persists across deep sleep so the
 //  gateway can spot gaps/duplicates. Returns OK / NO_ACK / TX_ERROR / NOT_INIT.
 // ================================================================
-LoRaSendResult loraSend(const SensorData& data, int32_t wifiRssi) {
+LoRaSendResult loraSend(const SensorData& data, int32_t wifiRssi, uint8_t maxAttempts) {
   if (!s_loraReady) {
     Serial.println(F("[LoRa] Not initialised"));
     return LoRaSendResult::NOT_INIT;
   }
+  const uint8_t attempts = (maxAttempts > 0 && maxAttempts < LORA_MAX_RETRIES)
+                           ? maxAttempts : LORA_MAX_RETRIES;
 
   char   payload[LORA_PAYLOAD_SIZE];
   size_t payloadLen = buildPayload(payload, sizeof(payload),
                                    data, wifiRssi, s_seqNum);
-  if (payloadLen == 0) return LoRaSendResult::TX_ERROR;
+  // Too big for one frame: a property of THIS reading, not a radio fault —
+  // reported separately so the backlog flush can leave it for the WiFi path.
+  if (payloadLen == 0) return LoRaSendResult::PAYLOAD_ERROR;
 
   char logPayload[LORA_PAYLOAD_SIZE];
   redactTokenForLog(payload, logPayload, sizeof(logPayload));
@@ -236,15 +255,15 @@ LoRaSendResult loraSend(const SensorData& data, int32_t wifiRssi) {
   bool anyTxOk = false;
 
   // Each attempt = transmit once, then wait for a matching ACK. Repeat up to
-  // LORA_MAX_RETRIES times; the first good ACK returns OK and exits immediately.
-  for (uint8_t attempt = 1; attempt <= LORA_MAX_RETRIES; attempt++) {
+  // `attempts` times; the first good ACK returns OK and exits immediately.
+  for (uint8_t attempt = 1; attempt <= attempts; attempt++) {
     // --- Transmit ---
     int txState = radio.transmit((uint8_t*)payload, payloadLen);
 
     if (txState != RADIOLIB_ERR_NONE) {
       Serial.printf("[LoRa] TX error %d (attempt %d/%d)\n",
-                    txState, attempt, LORA_MAX_RETRIES);
-      delay(LORA_RETRY_DELAY_MS);
+                    txState, attempt, attempts);
+      if (attempt < attempts) delay(LORA_RETRY_DELAY_MS);
       continue;
     }
 
@@ -320,10 +339,10 @@ LoRaSendResult loraSend(const SensorData& data, int32_t wifiRssi) {
       return LoRaSendResult::OK;
     }
     Serial.printf("[LoRa] No ACK within window (attempt %d/%d)\n",
-                  attempt, LORA_MAX_RETRIES);
+                  attempt, attempts);
 
-    if (attempt < LORA_MAX_RETRIES) {
-      Serial.printf("[LoRa] Retrying in %d ms...\n", LORA_RETRY_DELAY_MS);
+    if (attempt < attempts) {
+      Serial.printf("[LoRa] Retrying in %lu ms...\n", (unsigned long)LORA_RETRY_DELAY_MS);
       delay(LORA_RETRY_DELAY_MS);
     }
   }

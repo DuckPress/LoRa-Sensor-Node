@@ -4,7 +4,7 @@
 // ================================================================
 //  Firmware Version
 // ================================================================
-#define FIRMWARE_VERSION "1.2.10"
+#define FIRMWARE_VERSION "1.2.11"
 
 // ================================================================
 //  Node Identity
@@ -111,6 +111,10 @@ constexpr uint32_t    NTP_MIN_VALID_EPOCH  = 1700000000UL; // ~2023-11; "set" be
 // clock (gw_ts) instead of a drifted node_ts. Set generously so a normal WiFi
 // cadence never trips it.
 constexpr uint32_t    MAX_RTC_UNSYNCED_SEC = 48UL * 3600UL; // 48 h
+// The RTC can't legitimately read EARLIER than the last successful sync (it
+// only runs forward); beyond this tolerance it was reset (e.g. re-seeded from
+// the firmware build time after losing power) and its time is not trusted.
+constexpr uint32_t    RTC_BACKWARD_TOLERANCE_SEC = 300;
 
 // Malaysia = UTC+8. NTP is fetched as plain UTC (configTime(0,0,…) in
 // Lilygo.ino, so time(nullptr) is unambiguously a true Unix epoch) and this
@@ -144,16 +148,47 @@ constexpr uint32_t OTA_HTTP_TIMEOUT_MS = 15000;
 //  back to deep sleep.
 //
 //  SLEEP_DURATION_US  — how long to sleep between wakes (µs).
-//  WIFI_UPLOAD_EVERY_N — do a WiFi cloud upload every N wakes.
-//                         10 wakes × 30 s = ~5 min between uploads.
-//  OTA_CHECK_EVERY_N  — check GitHub for firmware updates every N wakes.
-//                         2880 wakes × 30 s = ~24 h.
+//  WIFI_UPLOAD_EVERY_N — do a WiFi cloud upload every N wakes
+//                         (5 wakes × 60 s = ~5 min between uploads).
+//  OTA_CHECK_EVERY_N  — check GitHub for firmware updates every N wakes
+//                         (4320 wakes × 60 s = ~3 days).
 // ================================================================
 constexpr uint64_t SLEEP_DURATION_US   = 60ULL * 1000000ULL;  // 60 s — one reading per minute
 constexpr uint32_t WIFI_UPLOAD_EVERY_N = 5;         // every ~5 minutes at the 60 s cadence
 // Automatic OTA checks remain infrequent. A remote request in the Config tab
-// causes a check on the next WiFi wake instead.
+// (ota_update_requested) adds checks on WiFi wakes, rate-limited below.
 constexpr uint32_t OTA_CHECK_EVERY_N   = 4320;      // every ~3 days at the 60 s cadence
+
+// WiFi backoff. Every WiFi attempt that fails costs a fast-reconnect try plus
+// up to WIFI_CONNECT_TIMEOUT_MS of radio per configured SSID (~25 s with two
+// networks) — at a site with no reachable network that alone is ~200 mAh/day.
+// After WIFI_FAIL_BACKOFF_AFTER failed WiFi wakes in a row the node only tries
+// every WIFI_BACKOFF_EVERY_N wakes (~1 h); one success restores the normal
+// interval, and wake #1 after any reset always tries.
+constexpr uint8_t  WIFI_FAIL_BACKOFF_AFTER = 3;
+constexpr uint32_t WIFI_BACKOFF_EVERY_N    = 60;
+static_assert(WIFI_BACKOFF_EVERY_N % WIFI_UPLOAD_EVERY_N == 0,
+              "backed-off WiFi wakes must be a subset of the normal WiFi wakes");
+static_assert(OTA_CHECK_EVERY_N % WIFI_BACKOFF_EVERY_N == 0 &&
+              OTA_CHECK_EVERY_N % WIFI_UPLOAD_EVERY_N == 0,
+              "every periodic OTA wake must also be a WiFi wake");
+
+// LoRa backoff. While the gateway is unreachable every wake would otherwise
+// spend LORA_MAX_RETRIES full transmit + 3 s ACK-listen cycles (~16 s awake).
+// After LORA_NOACK_BACKOFF_AFTER un-ACKed wakes in a row each wake makes only
+// LORA_BACKOFF_ATTEMPTS attempt(s) — still enough to notice the gateway is
+// back, at which point the full retry count returns.
+constexpr uint32_t LORA_NOACK_BACKOFF_AFTER = 5;
+constexpr uint8_t  LORA_BACKOFF_ATTEMPTS    = 1;
+
+// A standing Config request (ota_update_requested=1) is honoured at most once
+// per OTA_REQUEST_MIN_WAKES (~1 h), never on wake #1 after a reset (the
+// cold-boot wake already carries the heaviest radio load — a 1.3 MB download on
+// top of it is how a marginal cell browns out), and only when the resting
+// battery is at least OTA_MIN_BAT_V (a brownout mid-flash wastes the download;
+// USB-only operation, an implausible reading, is always allowed).
+constexpr uint32_t OTA_REQUEST_MIN_WAKES = 60;
+constexpr float    OTA_MIN_BAT_V         = 3.70f;
 
 // ----------------------------------------------------------------
 //  Survey mode — bathymetric-reference operation
@@ -298,7 +333,10 @@ constexpr float    LD2413_MAX_CM           =  460.0f;  // ~= SENSOR_HEIGHT_CM + 
 constexpr uint8_t  LD2413_SAMPLE_N         =   20;     // frames collected per read
 constexpr uint8_t  LD2413_TRIM_N           =    5;     // drop 5 low + 5 high
 constexpr uint32_t LD2413_FRAME_TIMEOUT_MS =  300;     // per-frame read timeout
-constexpr uint32_t LD2413_READ_BUDGET_MS   = 2500;     // hard cap on the whole burst
+// Hard cap on the whole burst. Must cover LD2413_SAMPLE_N frames at the
+// module's report cycle (20 × 160 ms = 3.2 s) plus margin — at 2.5 s the burst
+// was cut to ~15 frames every wake.
+constexpr uint32_t LD2413_READ_BUDGET_MS   = 3600;
 constexpr uint32_t LD2413_BOOT_MS          =  700;     // power-up → first data frame
 
 // One-time module configuration. The min/max range + report cycle are stored
@@ -342,6 +380,10 @@ constexpr uint8_t LIS2DW12_ADDR_ALT = 0x18;   // SA0/SDO low
 constexpr float   TILT_MOVED_DEG    = 1.0f;   // tilt change (deg) that flags "moved"
 constexpr int8_t  PIN_TILT_INT      = -1;     // LIS2DW12 INT1 -> ESP32 RTC GPIO; -1 = no motion wake
 constexpr uint8_t TILT_WAKE_THS_LSB = 8;      // wake-up threshold, 1 LSB = 31.25 mg (8 ≈ 250 mg)
+// After a motion wake the interrupt stays disarmed for this many wakes, so a
+// vibrating mount (wind, waves on the pole) can't keep re-waking the node —
+// each wake is a full measure + transmit cycle.
+constexpr uint8_t MOTION_WAKE_HOLDOFF_WAKES = 10;
 
 // ----------------------------------------------------------------
 //  Optional barometer (BMP280 / BME280 on Wire1, runtime-detected)
@@ -364,9 +406,9 @@ constexpr const char* CRASHLOG_FILENAME = "/crashlog.csv";
 // ================================================================
 //  Kalman Filter — 1-D constant-position model
 //
-//  Applied to the trimmed-mean ultrasonic reading across wakes.
-//  State persists in RTC RAM so the filter warms up across deep
-//  sleep cycles rather than restarting cold every reading.
+//  One filter PER distance sensor (radar, ultrasonic), applied to that
+//  sensor's trimmed-mean reading across wakes. State persists in RTC RAM
+//  so the filters warm up across deep sleep instead of restarting cold.
 //
 //  KALMAN_Q  — process noise variance (cm²).
 //              How much the true distance is expected to change
@@ -463,6 +505,9 @@ constexpr const char* LOG_FILENAME     = "/tidelog.csv";
 // Where sdInit() rolls an existing tidelog.csv whose header doesn't match the
 // current LOG_HEADER (a firmware schema change), so files never mix schemas.
 constexpr const char* LOG_ROLLED_FILENAME = "/tidelog_old.csv";
+// ...and if that name is taken (an earlier schema change), the first free one
+// of /tidelog_old2.csv … /tidelog_old99.csv — a roll never deletes an older log.
+constexpr const char* LOG_ROLLED_PATTERN  = "/tidelog_old%d.csv";
 // Boot/reset diagnostics — one line per non-deep-sleep reboot (brownout/panic).
 constexpr const char* BOOTLOG_FILENAME = "/bootlog.csv";
 // Columns after pressure_hpa (node >= 1.2.10, dual-sensor build):
@@ -500,24 +545,25 @@ constexpr float    ADAPTIVE_DELTA_SLOW_CM =  1.0f;  // cm — lengthen sleep bel
 // ================================================================
 //  Pending Upload Queue
 //
-//  On non-WiFi wakes the current reading is buffered to pending.csv.
-//  On the next WiFi wake all buffered entries are uploaded to GAS
-//  (best-effort) before the current reading, then the file is deleted.
+//  Any reading the gateway didn't ACK (and that wasn't uploaded directly
+//  over WiFi) is appended to pending.csv. The backlog drains oldest-first:
+//  over WiFi on WiFi wakes (pendingFlush) and over LoRa on wakes whose live
+//  reading was ACKed (loraFlushPending).
 //
 //  PENDING_MAX_ENTRIES caps file growth when the gateway is offline
 //  for a long period.  Once the limit is hit, new readings are dropped
 //  from the queue (the backlog is kept).  No data is truly lost — the
 //  full record is always available in tidelog.csv.
 //
-//  pending.csv columns (no header):
-//    ts, dist_k, dist_raw, wl, temp, hum, bat, sd, n, sm, mv
-//  (the trailing QC fields — burst std-dev, burst sample count, survey-mode
-//   and mount-moved flags — are optional: lines queued by older firmware carry
-//   only the first 7 and still parse, with sd=-1, n=0, sm=0, mv=0 defaults.)
+//  pending.csv lines (no header):  N|ts,dist_k,dist_raw,wl,temp,hum,bat,
+//                                    sd,n,sm,mv,tl,pr,st,du,rv
+//  N is a legacy per-line counter (kept for format compatibility). Every
+//  field after `bat` is optional when reading, so lines queued by older
+//  firmware still parse (see pending.cpp for the defaults).
 // ================================================================
 constexpr const char*  PENDING_FILENAME    = "/pending.csv";
-// 7,500 records: approximately 31.25 h at a 15 s cadence, or 20.8 h at the
-// current 10 s cadence. This uses roughly 600 KB of microSD space.
+// 7,500 records ≈ 5.2 days at the 60 s cadence (2.6 days in survey mode);
+// roughly 750 KB of microSD space.
 constexpr uint16_t     PENDING_MAX_ENTRIES = 7500;
 
 //  PENDING_FLUSH_MAX_PER_WAKE bounds how many queued entries are uploaded
@@ -533,18 +579,23 @@ constexpr uint16_t     PENDING_FLUSH_MAX_PER_WAKE = 40;
 constexpr uint8_t      PENDING_BATCH_ENTRIES       = 8;
 constexpr uint16_t     PENDING_BATCH_MAX_BODY      = 1200;
 
-//  PENDING_MAX_RETRIES — an entry that has failed this many upload attempts
-//  is dropped rather than kept forever, so one persistently-rejected reading
-//  (e.g. a GAS-side validation issue) can't occupy a flush-budget slot on
-//  every WiFi wake indefinitely. tidelog.csv on SD remains the complete
-//  record regardless.
-constexpr uint8_t      PENDING_MAX_RETRIES = 10;
+//  Failed uploads never cost data. A transport or server failure (no WiFi
+//  route, timeout, quota, lock contention, auth) keeps every queued entry
+//  unchanged and simply stops the flush for this wake; only rows the cloud
+//  explicitly rejects as invalid are dropped (tidelog.csv keeps them anyway).
+//
+//  LORA_FLUSH_SKIP_AFTER — the LoRa flush only runs right after the live
+//  reading was ACKed, so a backlog packet that goes unacknowledged at the
+//  head of the queue this many wakes in a row points at that entry, not the
+//  link: it is moved to the tail so the rest of the backlog can drain (the
+//  WiFi flush still carries it).
+constexpr uint8_t      LORA_FLUSH_SKIP_AFTER = 10;
 
 //  PENDING_MAX_LINE_LEN — a single queue line longer than this is treated as
-//  corruption (a torn write / FAT damage can leave a record with no newline,
-//  which readStringUntil() would otherwise pull into RAM without bound). When
-//  seen, the queue file is quarantined to PENDING_BAD_FILENAME and a fresh one
-//  started, so a corrupt queue can't OOM the node or jam the flush forever.
+//  corruption (a torn write / FAT damage can leave a record with no newline).
+//  Lines are read with a bounded reader that stops at this length, so a
+//  corrupt file can't pull an unbounded blob into RAM; the queue file is then
+//  quarantined to PENDING_BAD_FILENAME and a fresh one started.
 constexpr uint16_t     PENDING_MAX_LINE_LEN = 300;
 constexpr const char*  PENDING_BAD_FILENAME = "/pending.bad";
 
@@ -618,8 +669,9 @@ constexpr uint32_t DISPLAY_HOLD_SHORT_MS =  400;
 //
 //  When the LiPo drops below BAT_CUTOFF_V the node skips LoRa TX
 //  and WiFi entirely (both can draw 100–120 mA peak) and goes
-//  directly back to deep sleep at SLEEP_MAX_US to give the battery
-//  time to recover.  The SD log still captures the low-bat event.
+//  directly back to deep sleep for SAFE_MODE_SLEEP_US to give the
+//  battery time to recover. The SD log still captures the reading, and
+//  it is queued so it reaches the cloud once the cell recovers.
 // ================================================================
 constexpr float BAT_CUTOFF_V = 3.3f;
 
