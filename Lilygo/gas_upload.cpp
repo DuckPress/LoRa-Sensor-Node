@@ -34,7 +34,10 @@ bool gasFetch(const char* query, String& bodyOut) {
   // cloud accepts one outer token for a whole base64 batch. Empty = omitted,
   // which keeps an un-provisioned node working while cloud auth is off.
   const char* gasTok = secretGasToken();
-  char url[2304];
+  // Static, not on the stack: 2.3 KB of loopTask stack under the TLS handshake
+  // that follows is what overflowed it in 1.2.11. gasFetch is only ever called
+  // from the single loopTask and never re-enters itself.
+  static char url[2304];
   int n = (gasTok[0] != '\0')
     ? snprintf(url, sizeof(url), "https://%s%s?%s&token=%s", gasHost, gasPath, query, gasTok)
     : snprintf(url, sizeof(url), "https://%s%s?%s", gasHost, gasPath, query);

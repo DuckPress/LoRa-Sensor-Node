@@ -52,6 +52,14 @@
 #include <Preferences.h>  // NVS boot-loop counter (survives brownout/panic)
 #include <sys/time.h>     // gettimeofday() — measures an early (motion) wake
 
+// The whole wake runs inside setup() on Arduino's loopTask, whose default
+// 8 KB stack was too small: the WiFi backlog flush nests a TLS handshake
+// (mbedTLS ECC needs several KB) under pendingFlush → gasUploadBatch →
+// gasFetch, and overran it — the end-of-stack watchpoint fired (core dump
+// exc_cause 65 at WIFI_FLUSH) and the node crash-looped (1.2.11). 16 KB leaves
+// ample headroom; the S3 has ~270 KB of free heap.
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);
+
 // ================================================================
 //  RTC RAM — persists across deep sleep
 // ================================================================

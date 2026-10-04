@@ -101,6 +101,14 @@ static const char* excCauseName(uint32_t c) {
     case 20: return "InstrFetchProhibited";
     case 28: return "LoadProhibited";
     case 29: return "StoreProhibited";
+    // ESP-IDF panic reasons are stored as 64 + PANIC_RSN_* (Xtensa has 64
+    // hardware causes). A debug exception on loopTask is almost always the
+    // end-of-stack watchpoint, i.e. a stack overflow.
+    case 65: return "DebugException_StackOverflow";
+    case 66: return "DoubleException";
+    case 67: return "KernelException";
+    case 69: case 70: return "InterruptWDT";
+    case 71: return "CacheError";
     default: return "";
   }
 }
