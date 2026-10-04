@@ -717,6 +717,17 @@ void setup() {
       // mirrors the gateway's formatIsoLocal() so node_ts and gw_ts share one
       // convention.
       crashStageSet(STAGE_NTP);
+      // Resolve once BEFORE starting SNTP. The core's first hostByName() after
+      // WiFi comes up calls dns_clear_cache() from this task without the lwIP
+      // core lock (arduino-esp32 3.3.x NetworkManager). If SNTP's own DNS
+      // query is still pending at that moment — NTP slow or timed out — its
+      // callback runs here, calls udp_new() unlocked and trips
+      // "assert udp_new_ip_type" (seen at NODECFG in 1.2.11). Clearing the
+      // cache now, with nothing pending, means later lookups never clear it.
+      {
+        IPAddress ntpIp;
+        WiFi.hostByName(NTP_SERVER1, ntpIp);
+      }
       configTime(0, 0, NTP_SERVER1, NTP_SERVER2);   // UTC epoch; local shift applied below
       uint32_t ntpStart = millis();
       time_t   nowUtc   = 0;
