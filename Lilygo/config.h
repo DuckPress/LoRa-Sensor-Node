@@ -4,7 +4,7 @@
 // ================================================================
 //  Firmware Version
 // ================================================================
-#define FIRMWARE_VERSION "1.2.15"
+#define FIRMWARE_VERSION "1.2.16"
 
 // ================================================================
 //  Node Identity
@@ -283,7 +283,10 @@ constexpr uint32_t DEBUG_MODE_TIMEOUT_MS = 600000UL;  // 10 min safety cap, then
 // RCWL-1670 (TRIG/ECHO) — GPIO41 TRIG, GPIO42 ECHO
 constexpr uint8_t  PIN_RCWL_TRIG            = 41;
 constexpr uint8_t  PIN_RCWL_ECHO            = 42;
-constexpr float    RCWL1670_MIN_CM          = 2.0f;
+// 20 cm, not the module's 2 cm: a blocked or self-echoing sensor reads a few
+// cm with zero spread (seen on the bench: a fixed 2.7 cm), and the gauge sits
+// well over 20 cm above the water, so anything closer is never water (1.2.16).
+constexpr float    RCWL1670_MIN_CM          = 20.0f;
 constexpr float    RCWL1670_MAX_CM          = 450.0f;
 constexpr uint8_t  RCWL1670_SAMPLE_N        = 30;  // more pings → lower per-reading noise
 constexpr uint8_t  RCWL1670_TRIM_N          =  8;  // discard 8 lowest + 8 highest (avg middle 14)
@@ -417,32 +420,31 @@ constexpr const char* CRASHLOG_FILENAME = "/crashlog.csv";
 //
 //  KALMAN_Q  — process noise variance (cm²).
 //              How much the true distance is expected to change
-//              between two 30-second readings.  Higher → trusts
-//              new measurements more; lower → smoother but slower
-//              to follow real changes.
+//              between two 60-second readings (scaled by the real
+//              gap).  Higher → trusts new measurements more; lower
+//              → smoother but slower to follow real changes.
 //
 //  KALMAN_R  — measurement noise variance (cm²).
-//              Residual uncertainty of the trimmed-mean reading
-//              after outlier removal.  Higher → trusts the model
-//              more; lower → trusts measurements more.
+//              Fallback only: each wake normally uses the variance of
+//              its own burst average, burst_sd² / samples averaged.
+//              Higher → trusts the model more; lower → trusts
+//              measurements more.
 //
 //  KALMAN_P0 — initial error covariance.  Large value = "I don't
 //              know where the water is yet."  Converges in a few
 //              readings.
 // ================================================================
-constexpr float KALMAN_Q  =  0.5f;      // cm² — low: tide changes slowly, so trust
-                                        //   the model and smooth out ±2 cm sensor
-                                        //   jitter. The spike gate (below) handles
-                                        //   outliers, so heavy smoothing no longer
-                                        //   risks the old slow-recovery lag.
-constexpr float KALMAN_R  =  9.0f;      // cm² — treat each reading as noisier →
-                                        //   more smoothing of the steady signal.
-                                        //   Fallback only: used when this wake's
-                                        //   burst standard deviation is unknown.
-                                        //   Otherwise the filter uses the ACTUAL
-                                        //   burst_sd² for R (see kalmanUpdate) —
-                                        //   this fixed value is just the estimate
-                                        //   burst_sd itself now replaces per-wake.
+constexpr float KALMAN_Q  =  4.0f;      // cm² per 60 s — sized for a ~6 m tide range
+                                        //   (Port Klang moves up to ~2.5 cm/min). At
+                                        //   0.5 the random-walk filter trailed a
+                                        //   moving tide by up to ~6 cm (calm) and
+                                        //   ~17 cm (choppy); at 4 it stays within
+                                        //   ~1.5–5 cm in simulation (1.2.16). The
+                                        //   spike gate (below) still handles outliers.
+constexpr float KALMAN_R  =  9.0f;      // cm² — fallback only: used when this
+                                        //   wake's burst standard deviation is
+                                        //   unknown. Otherwise R = burst_sd² /
+                                        //   samples averaged (see kalmanUpdate).
 constexpr float KALMAN_R_MIN = 1.0f;    // cm² — floor for that burst-derived R, so
                                         //   an unusually tight burst can't make the
                                         //   filter over-trust a single reading.

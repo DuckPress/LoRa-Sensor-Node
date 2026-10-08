@@ -123,8 +123,12 @@ static bool s_surveyMode = false;
 void sensorsSetSurveyMode(bool on) { s_surveyMode = on; }
 
 // Burst QC stats filled by collapseBurst() during the last distance read.
-static float   g_burstSd = -1.0f;
-static uint8_t g_burstN  = 0;
+// g_burstNUsed = how many samples the returned value actually averages (the
+// trimmed-mean middle, or all of them for the median fallback) — it sets the
+// noise of that VALUE (sd²/n), which is what the Kalman filter needs.
+static float   g_burstSd    = -1.0f;
+static uint8_t g_burstN     = 0;
+static uint8_t g_burstNUsed = 0;
 
 // ================================================================
 //  sensorsSetSleepDuration — tell the Kalman filter how long the PREVIOUS deep
@@ -144,17 +148,19 @@ void sensorsSetSleepDuration(uint32_t secs) {
 //  Physical justification for the scaling:
 //    Q represents the variance of how much the true distance can
 //    change in one timestep.  If the timestep is dt seconds and the
-//    nominal step is T₀ = 30 s, then Q(dt) = KALMAN_Q × dt/T₀.
+//    nominal step is T₀ = SLEEP_DURATION_US (60 s), then Q(dt) = KALMAN_Q × dt/T₀.
 //
-//    Short sleep (10 s) → smaller per-step variance → smoother.
-//    Long sleep  (120 s) → larger per-step variance → more responsive.
+//    Short gap (30 s survey) → smaller per-step variance → smoother.
+//    Long gap (missed wakes)  → larger per-step variance → more responsive.
 // ================================================================
 // burstSd = this wake's burst standard deviation (cm), or -1 if unknown
 // (collapseBurst() couldn't compute one — e.g. too few in-range samples).
-// When known, it directly measures this specific reading's noise/roughness,
-// so it replaces the fixed KALMAN_R estimate for the measurement-noise term:
-// a calm burst is trusted more than KALMAN_R assumed, a rough one less.
-static float kalmanUpdate(SensorType t, float z, float burstSd) {
+// nUsed   = how many samples z averages (the trimmed-mean middle).
+// When known, they set this reading's own measurement noise R = sd²/nUsed —
+// the variance of the burst AVERAGE, not of one sample (1.2.16: using sd²
+// alone over-stated R ~10×, so the filter lagged a fast 6 m tide by up to
+// ~17 cm in choppy water). A calm burst is trusted more, a rough one less.
+static float kalmanUpdate(SensorType t, float z, float burstSd, uint8_t nUsed) {
   // z = this wake's measurement from sensor t (trimmed mean; the ultrasonic's
   // is already speed-of-sound corrected). NOMINAL_SLEEP_S = the cadence Q is
   // expressed per; used to scale Q by the real gap below.
@@ -218,8 +224,8 @@ static float kalmanUpdate(SensorType t, float z, float burstSd) {
   // ── Predict ──
   // PREDICT: grow the uncertainty by the process noise Q (how much the true
   // level could have drifted since the last INCORPORATED reading — accumulated
-  // across any skipped/held wakes in between). A 120 s gap admits ~4× the
-  // drift of a 30 s gap → the filter trusts a new reading more after long gaps.
+  // across any skipped/held wakes in between). A 120 s gap admits 2× the
+  // drift of a 60 s gap → the filter trusts a new reading more after long gaps.
   float qScaled = KALMAN_Q * ((float)k.elapsedSecs / NOMINAL_SLEEP_S);
   k.elapsedSecs = 0;                    // gap consumed by this update
   float pPred   = k.p + qScaled;        // predicted error covariance
@@ -229,11 +235,12 @@ static float kalmanUpdate(SensorType t, float z, float burstSd) {
   // our estimate is uncertain (trust the reading), K→0 when the reading is noisy
   // (large R → trust the model). Nudge the estimate toward z by K × the
   // residual, then shrink the covariance now that a reading has been folded in.
-  // R is this wake's ACTUAL burst variance when known (floored at KALMAN_R_MIN
-  // so an unusually tight burst can't cause overtrust), else the fixed KALMAN_R.
+  // R is the variance of this wake's burst AVERAGE when known (sd²/nUsed,
+  // floored at KALMAN_R_MIN so an unusually tight burst can't cause
+  // overtrust), else the fixed KALMAN_R.
   float rMeas = KALMAN_R;
   if (burstSd >= 0.0f) {
-    float r = burstSd * burstSd;
+    float r = burstSd * burstSd / (float)(nUsed > 0 ? nUsed : 1);
     rMeas = (r > KALMAN_R_MIN) ? r : KALMAN_R_MIN;
   }
   float K = pPred / (pPred + rMeas);   // Kalman gain
@@ -320,8 +327,9 @@ static float trimmedMean(float* arr, uint8_t n, uint8_t trimN) {
 // of the surface, which is exactly what a survey-grade uncertainty flag needs
 // (the trimmed mean deliberately hides it). Shared by every distance sensor.
 static float collapseBurst(float* arr, uint8_t n, uint8_t trimN) {
-  g_burstN  = n;
-  g_burstSd = -1.0f;                    // unknown until proven otherwise
+  g_burstN     = n;
+  g_burstNUsed = n;
+  g_burstSd    = -1.0f;                 // unknown until proven otherwise
   if (n == 0) return -1.0f;             // nothing usable
 
   if (n >= 2) {
@@ -339,6 +347,7 @@ static float collapseBurst(float* arr, uint8_t n, uint8_t trimN) {
 
   if (n < (uint8_t)(2u * trimN + 1u))   // too few to trim → median fallback
     return medianOf(arr, n);
+  g_burstNUsed = n - 2u * trimN;        // the middle samples the mean averages
   return trimmedMean(arr, n, trimN);    // normal: trimmed mean
 }
 
@@ -1158,23 +1167,26 @@ SensorReadResult readAllSensors(SensorData& out) {
   // Step 1 — raw distance bursts from every sensor present this wake, kept
   // per sensor so both reach the log/cloud. Each read leaves its QC stats in
   // g_burstSd / g_burstN; capture them before the next sensor overwrites them.
-  float   raw[SENSOR_TYPE_COUNT];
-  float   sd [SENSOR_TYPE_COUNT];
-  uint8_t n  [SENSOR_TYPE_COUNT];
-  for (uint8_t t = 0; t < SENSOR_TYPE_COUNT; t++) { raw[t] = -1.0f; sd[t] = -1.0f; n[t] = 0; }
+  float   raw  [SENSOR_TYPE_COUNT];
+  float   sd   [SENSOR_TYPE_COUNT];
+  uint8_t n    [SENSOR_TYPE_COUNT];
+  uint8_t nUsed[SENSOR_TYPE_COUNT];   // samples the value averages (Kalman R)
+  for (uint8_t t = 0; t < SENSOR_TYPE_COUNT; t++) { raw[t] = -1.0f; sd[t] = -1.0f; n[t] = 0; nUsed[t] = 0; }
 #if defined(ENABLE_SENSOR_LD2413)
   if (s_readThisWake[SENSOR_TYPE_LD2413]) {
-    raw[SENSOR_TYPE_LD2413] = readLD2413Raw();
-    sd [SENSOR_TYPE_LD2413] = g_burstSd;
-    n  [SENSOR_TYPE_LD2413] = g_burstN;
+    raw  [SENSOR_TYPE_LD2413] = readLD2413Raw();
+    sd   [SENSOR_TYPE_LD2413] = g_burstSd;
+    n    [SENSOR_TYPE_LD2413] = g_burstN;
+    nUsed[SENSOR_TYPE_LD2413] = g_burstNUsed;
     esp_task_wdt_reset();
   }
 #endif
 #if defined(ENABLE_SENSOR_RCWL1670)
   if (s_readThisWake[SENSOR_TYPE_RCWL1670]) {
-    raw[SENSOR_TYPE_RCWL1670] = readRCWL1670Raw();
-    sd [SENSOR_TYPE_RCWL1670] = g_burstSd;
-    n  [SENSOR_TYPE_RCWL1670] = g_burstN;
+    raw  [SENSOR_TYPE_RCWL1670] = readRCWL1670Raw();
+    sd   [SENSOR_TYPE_RCWL1670] = g_burstSd;
+    n    [SENSOR_TYPE_RCWL1670] = g_burstN;
+    nUsed[SENSOR_TYPE_RCWL1670] = g_burstNUsed;
     esp_task_wdt_reset();
   }
 #endif
@@ -1270,7 +1282,7 @@ SensorReadResult readAllSensors(SensorData& out) {
   for (uint8_t t = 0; t < SENSOR_TYPE_COUNT; t++) filtered[t] = -1.0f;
   for (uint8_t i = 0; i < SENSOR_ORDER_N; i++) {
     const SensorType t = SENSOR_ORDER[i];
-    if (raw[t] > 0.0f) filtered[t] = kalmanUpdate(t, raw[t], sd[t]);
+    if (raw[t] > 0.0f) filtered[t] = kalmanUpdate(t, raw[t], sd[t], nUsed[t]);
   }
   out.distanceCm = out.distanceValid ? filtered[out.sensorType] : -1.0f;
 

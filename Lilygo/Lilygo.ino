@@ -813,6 +813,15 @@ void setup() {
                         earlyBatV, OTA_MIN_BAT_V);
         } else {
           if (otaReqDue) s_lastOtaReqWake = s_wakeCount;
+          // A successful update reboots straight out of checkForOTAUpdate(),
+          // skipping the queueing at the end of this wake — so secure an
+          // unconfirmed reading FIRST. Queued now, it is flushed in order with
+          // the rest of the backlog below (or on a later wake).
+          if (!readingSecured) {
+            pendingAppend(data);
+            s_backlogPending = true;
+            readingSecured   = true;
+          }
           crashStageSet(STAGE_OTA);
           displaySplash("SENSOR " FIRMWARE_VERSION, "OTA check...");
           otaInit();
