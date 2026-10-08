@@ -4,7 +4,7 @@
 // ================================================================
 //  Firmware Version
 // ================================================================
-#define FIRMWARE_VERSION "1.2.13"
+#define FIRMWARE_VERSION "1.2.15"
 
 // ================================================================
 //  Node Identity
@@ -325,11 +325,13 @@ constexpr uint32_t LD2413_BAUD             = 115200;
 constexpr float    LD2413_MIN_CM           =   15.0f;  // module floor 0.15 m
 // Clamp the ACCEPTED range to the mount geometry, not the module's 10 m ceiling.
 // Water can never sit farther than the sensor's own height above the datum
-// (SENSOR_HEIGHT_CM, ~450), so anything beyond that + a little noise margin is
-// physically impossible — a "no-target" ceiling artifact (e.g. the 590 cm the
-// radar reports when it loses lock). Rejecting it (-> -1) beats logging a bogus
-// water_level=0. Raise this if you mount the sensor higher than ~455 cm. (H1)
-constexpr float    LD2413_MAX_CM           =  460.0f;  // ~= SENSOR_HEIGHT_CM + margin
+// (SENSOR_HEIGHT_CM), so anything beyond that + a noise margin is physically
+// impossible — a "no-target" ceiling artifact (e.g. the 590 cm the radar
+// reported on the bench when it lost lock). Rejecting it (-> -1) beats logging
+// a bogus water_level=0. Sized for the Port Klang jetty (1.2.14): deck ~7 m
+// above the lowest water, tide range ~6 m → 1–7 m to the water, + margin for
+// wave troughs and extra-low tides. Keep ≈ LD2413_CFG_MAX_MM. (H1)
+constexpr float    LD2413_MAX_CM           =  850.0f;  // ~= SENSOR_HEIGHT_CM + margin
 constexpr uint8_t  LD2413_SAMPLE_N         =   20;     // frames collected per read
 constexpr uint8_t  LD2413_TRIM_N           =    5;     // drop 5 low + 5 high
 constexpr uint32_t LD2413_FRAME_TIMEOUT_MS =  300;     // per-frame read timeout
@@ -343,10 +345,13 @@ constexpr uint32_t LD2413_BOOT_MS          =  700;     // power-up → first dat
 // in the LD2413's OWN flash, so this only needs to run ONCE per physical
 // module. Keep 0 on a battery node (the ~1 s config handshake every wake is
 // pure overhead); set to 1 for a single boot against a factory-fresh module,
-// then set back to 0 and re-flash.
+// then set back to 0 and re-flash. (Can also be set from the build command
+// with -DLD2413_CONFIGURE_ON_BOOT=1, leaving this file untouched.)
+#ifndef LD2413_CONFIGURE_ON_BOOT
 #define LD2413_CONFIGURE_ON_BOOT 0
+#endif
 constexpr uint16_t LD2413_CFG_MIN_MM    =  150;   // reporting floor (mm)
-constexpr uint16_t LD2413_CFG_MAX_MM    = 4600;   // reporting ceiling (mm) ~= LD2413_MAX_CM (only applied when LD2413_CONFIGURE_ON_BOOT=1)
+constexpr uint16_t LD2413_CFG_MAX_MM    = 8500;   // reporting ceiling (mm) ~= LD2413_MAX_CM (only applied when LD2413_CONFIGURE_ON_BOOT=1)
 constexpr uint16_t LD2413_CFG_REPORT_MS =  160;   // stream cycle (ms) — 50..1000
 
 // SHT3x I2C address
@@ -496,7 +501,10 @@ constexpr size_t   LORA_PAYLOAD_SIZE   =  256;  // bumped: payload now includes 
 // ================================================================
 //  Tide / Water-Level Geometry
 // ================================================================
-constexpr float SENSOR_HEIGHT_CM = 450.0f;
+// Sensor face → zero line (cm). On-device default only (OLED + SD water_level);
+// the cloud uses Config sensor_height_cm, set from the TBM levelling on site.
+// 700 ≈ Port Klang jetty deck above the lowest water (1.2.14).
+constexpr float SENSOR_HEIGHT_CM = 700.0f;
 
 // ================================================================
 //  SD Logging

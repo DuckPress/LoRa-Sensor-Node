@@ -203,9 +203,18 @@ static const char* const LORA_TMP    = "/pending.ltmp";   // LoRa flush
 //  but the temp file holds the kept remainder. Runs before anything counts,
 //  appends to or flushes the queue — if a new reading started a fresh queue
 //  first, the remainder would be orphaned and the next flush would delete it.
+//
+//  If the queue still exists, a temp file is the partial copy of a flush that
+//  was cut off BEFORE it removed the queue: the queue is authoritative, so the
+//  temp is deleted. Left behind, it would be "recovered" the moment the queue
+//  next empties, re-queuing readings already delivered (1.2.15).
 // ================================================================
 static void recoverInterruptedFlush() {
-  if (SD.exists(PENDING_FILENAME)) return;
+  if (SD.exists(PENDING_FILENAME)) {
+    if (SD.exists(PENDING_TMP)) SD.remove(PENDING_TMP);
+    if (SD.exists(LORA_TMP))    SD.remove(LORA_TMP);
+    return;
+  }
   const char* tmp = SD.exists(PENDING_TMP) ? PENDING_TMP
                   : SD.exists(LORA_TMP)    ? LORA_TMP
                   : nullptr;
